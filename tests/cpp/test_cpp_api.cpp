@@ -405,6 +405,20 @@ static void test_nearest_smoke(const std::string& uri) {
     PASS();
 }
 
+static void test_multivector_rejects_flat_column(const std::string& uri) {
+    TEST(test_multivector_rejects_flat_column);
+    auto scanner = lance::Dataset::open(uri).scan();
+    const float query[8] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    bool caught = false;
+    try {
+        scanner.nearest_multivector("embedding", query, 8, 1, LANCE_DTYPE_FLOAT32, 1);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
+    PASS();
+}
+
 static void test_index_segments_smoke(const std::string& /*uri*/) {
     TEST(test_index_segments_smoke);
 
@@ -948,6 +962,7 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
+    test_multivector_rejects_flat_column(uri);
     test_index_segments_smoke(uri);
     test_index_segment_builder(uri);
     test_vector_models_and_reusable_segments(uri);

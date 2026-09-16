@@ -12513,3 +12513,28 @@ fn test_add_columns_stream_null_dataset_consumes_stream() {
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_stream_consumed(&stream, &drop_count);
 }
+
+#[test]
+fn test_multivector_nearest_rejects_null_handle() {
+    let column = c_str("vectors");
+    let query = [1.0f32, 0.0];
+    let status = unsafe {
+        lance_scanner_nearest_multivector(
+            ptr::null_mut(),
+            column.as_ptr(),
+            query.as_ptr().cast(),
+            2,
+            1,
+            0,
+            1,
+        )
+    };
+    assert_eq!(status, -1);
+    let error = lance_last_error_message();
+    assert!(!error.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(error) };
+    assert!(message.contains("NULL"));
+}

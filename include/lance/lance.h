@@ -1779,6 +1779,21 @@ int32_t lance_scanner_nearest(
 );
 
 /**
+ * Set one multi-vector query on a List<FixedSizeList<float16|float32|float64>> column.
+ * Inner vectors must be non-nullable and contain no null elements; the outer list may be nullable.
+ * query_data contains dimension * num_vectors aligned elements in row-major order.
+ * Both sizes and k must be positive. At most 128 query subvectors are accepted;
+ * num_vectors * k and refine_factor * k must each be at most 100000.
+ * Values are copied before returning. The default metric is L2 on every fragment.
+ * Scores sum each query vector's minimum distance; refinement defaults to 1.
+ * Returns 0 on success, -1 on error. Stored invalid elements fail during execution.
+ */
+int32_t lance_scanner_nearest_multivector(
+    LanceScanner* scanner, const char* column, const void* query_data,
+    size_t dimension, size_t num_vectors, LanceDataType element_type, uint32_t k
+);
+
+/**
  * Set both the minimum and maximum vector-index partition-search bounds.
  *
  * This replaces both bounds configured by earlier calls to any nprobes

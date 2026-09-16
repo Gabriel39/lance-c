@@ -37,6 +37,7 @@ mod index;
 mod index_model;
 mod index_segment;
 mod merge_insert;
+mod multivector;
 mod restore;
 pub mod runtime;
 mod scanner;

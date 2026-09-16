@@ -360,8 +360,18 @@ impl LanceScanner {
         if let Some(cols) = &self.columns {
             scanner.project(cols)?;
         }
+        let multi_vector = self.nearest.as_ref().is_some_and(|query| {
+            matches!(
+                query.query.data_type(),
+                arrow_schema::DataType::FixedSizeList(_, _)
+            )
+        });
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
+            if multi_vector {
+                // Retain Lance's window validation, but defer truncation until the final sort.
+                scanner.limit(None, None)?;
+            }
         }
         if let Some(bs) = self.batch_size {
             scanner.batch_size(bs);
@@ -437,7 +447,27 @@ impl LanceScanner {
             if let Some(query_parallelism) = self.query_parallelism {
                 scanner.query_parallelism(query_parallelism);
             }
-            if let Some(rf) = self.refine_factor {
+            if multi_vector {
+                if matches!(
+                    self.metric_override,
+                    Some(crate::index::LanceMetricType::Hamming)
+                ) {
+                    return Err(lance_core::Error::invalid_input_source(
+                        "multi-vector queries support only l2, cosine, and dot metrics".into(),
+                    ));
+                }
+                let refine = self.refine_factor.unwrap_or(1);
+                if refine == 0
+                    || n.k as usize
+                        > crate::multivector::MAX_QUERY_VECTOR_CANDIDATES / refine as usize
+                {
+                    return Err(lance_core::Error::invalid_input_source(
+                        "multi-vector refined candidate count must be in 1..=100000".into(),
+                    ));
+                }
+                // Validate actual stored values and refine candidate scores before TopK.
+                scanner.refine(refine);
+            } else if let Some(rf) = self.refine_factor {
                 scanner.refine(rf);
             }
             if let Some(ef) = self.ef {
@@ -445,6 +475,9 @@ impl LanceScanner {
             }
             if let Some(m) = self.metric_override {
                 scanner.distance_metric(m.to_distance());
+            } else if multi_vector {
+                // Resolve the same default on indexed and uncovered fragments.
+                scanner.distance_metric(lance_linalg::distance::DistanceType::L2);
             }
             if let Some(ui) = self.use_index {
                 scanner.use_index(ui);
@@ -476,6 +509,12 @@ impl LanceScanner {
         Ok(PreparedScanner {
             scanner,
             distributed_fts,
+            multi_vector_window: multi_vector.then_some((
+                self.offset.unwrap_or(0) as usize,
+                self.limit.map(|n| n as usize),
+            )),
+            batch_size: self.batch_size,
+            scan_statistics_callback: self.scan_statistics_callback.clone(),
         })
     }
 }
@@ -490,10 +529,45 @@ struct PreparedFtsExecution {
 struct PreparedScanner {
     scanner: lance::dataset::scanner::Scanner,
     distributed_fts: Option<PreparedFtsExecution>,
+    multi_vector_window: Option<(usize, Option<usize>)>,
+    batch_size: Option<usize>,
+    scan_statistics_callback: Option<ExecutionStatsCallback>,
 }
 
 impl PreparedScanner {
     async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
+        if let Some((offset, limit)) = self.multi_vector_window {
+            use datafusion::physical_expr::{PhysicalSortExpr, expressions};
+            use datafusion::physical_plan::{
+                coalesce_partitions::CoalescePartitionsExec, limit::GlobalLimitExec,
+                sorts::sort::SortExec,
+            };
+            let plan = crate::multivector::rewrite(self.scanner.create_plan().await?)?;
+            let sort = PhysicalSortExpr {
+                expr: expressions::col("_distance", plan.schema().as_ref())?,
+                options: arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            // Fragment-scoped Lance plans can reorder candidate batches during payload take.
+            // Apply the result window only after restoring distance order across all partitions.
+            // The nearest plan already bounds the candidate rows by k.
+            let sorted = Arc::new(SortExec::new(
+                [sort].into(),
+                Arc::new(CoalescePartitionsExec::new(plan)),
+            ));
+            let plan = Arc::new(GlobalLimitExec::new(sorted, offset, limit));
+            let stream = lance_datafusion::exec::execute_plan(
+                plan,
+                lance_datafusion::exec::LanceExecutionOptions {
+                    batch_size: self.batch_size,
+                    execution_stats_callback: self.scan_statistics_callback,
+                    ..Default::default()
+                },
+            )?;
+            return Ok(DatasetRecordBatchStream::new(stream));
+        }
         let Some(distributed_fts) = self.distributed_fts else {
             return self.scanner.try_into_stream().await;
         };
@@ -2676,6 +2750,21 @@ unsafe fn scanner_nearest_inner(
     }
     let column_str = unsafe { helpers::parse_c_string(column)? }.unwrap();
 
+    let query = unsafe { decode_query_values(query_data, query_len, element_type)? };
+
+    s.nearest = Some(NearestQuery {
+        column: column_str.to_string(),
+        query,
+        k,
+    });
+    Ok(0)
+}
+
+unsafe fn decode_query_values(
+    query_data: *const c_void,
+    query_len: usize,
+    element_type: i32,
+) -> Result<arrow_array::ArrayRef> {
     let dtype = match element_type {
         0 => LanceDataType::Float32,
         1 => LanceDataType::Float16,
@@ -2714,9 +2803,112 @@ unsafe fn scanner_nearest_inner(
         }
     };
 
+    Ok(query)
+}
+
+/// Set one multi-vector query, supplied as a row-major matrix of floating-point values.
+/// The caller must supply dimension * num_vectors aligned elements matching the column type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest_multivector(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_vectors: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        nearest_multivector_inner(
+            scanner,
+            column,
+            query_data,
+            dimension,
+            num_vectors,
+            element_type,
+            k,
+        )
+    },)
+}
+
+unsafe fn nearest_multivector_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_vectors: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    use arrow_schema::{DataType, Field};
+    let invalid = |message: &str| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(invalid("scanner, column, and query_data must not be NULL"));
+    }
+    if dimension == 0 || dimension > i32::MAX as usize || num_vectors == 0 || k == 0 {
+        return Err(invalid(
+            "dimension, num_vectors, and k must be positive; dimension must fit int32",
+        ));
+    }
+    if num_vectors > crate::multivector::MAX_QUERY_VECTORS
+        || num_vectors > crate::multivector::MAX_QUERY_VECTOR_CANDIDATES / k as usize
+    {
+        return Err(invalid(
+            "multi-vector query exceeds 128 subvectors or 100000 subvector-candidates",
+        ));
+    }
+    let (data_type, width) = match element_type {
+        0 => (DataType::Float32, 4),
+        1 => (DataType::Float16, 2),
+        2 => (DataType::Float64, 8),
+        _ => {
+            return Err(invalid(
+                "multi-vector queries require float16, float32, or float64",
+            ));
+        }
+    };
+    let count = dimension
+        .checked_mul(num_vectors)
+        .filter(|count| *count <= isize::MAX as usize / width)
+        .ok_or_else(|| invalid("query matrix byte size overflows"))?;
+    let s = unsafe { &mut *scanner };
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(invalid(
+            "nearest and full-text search are mutually exclusive",
+        ));
+    }
+    let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
+    let field = s
+        .dataset
+        .schema()
+        .field(column)
+        .ok_or_else(|| invalid("multi-vector column does not exist"))?;
+    match field.data_type() {
+        DataType::List(child) if !child.is_nullable() => match child.data_type() {
+            DataType::FixedSizeList(element, dim)
+                if *dim == dimension as i32 && *element.data_type() == data_type => {}
+            _ => return Err(invalid("multi-vector dimension/type mismatch")),
+        },
+        _ => {
+            return Err(invalid(
+                "multi-vector column must be List of non-nullable FixedSizeList",
+            ));
+        }
+    }
+    // A primitive array is interpreted as one vector by Lance. Preserve matrix shape even
+    // for a single subvector. Lance does not preserve element nullability in its schema.
+    let values = unsafe { decode_query_values(query_data, count, element_type)? };
+    crate::multivector::validate_query(values.as_ref())?;
+    let query = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", data_type, false)),
+        dimension as i32,
+        values,
+        None,
+    )?;
     s.nearest = Some(NearestQuery {
-        column: column_str.to_string(),
-        query,
+        column: column.to_string(),
+        query: Arc::new(query),
         k,
     });
     Ok(0)

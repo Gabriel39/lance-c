@@ -1417,6 +1417,16 @@ public:
         return *this;
     }
 
+    /// One multi-vector query, copied from dimension * num_vectors row-major elements.
+    Scanner& nearest_multivector(const std::string& column, const void* query_data,
+                                size_t dimension, size_t num_vectors,
+                                LanceDataType element_type, uint32_t k) {
+        if (lance_scanner_nearest_multivector(handle_.get(), column.c_str(), query_data,
+                                            dimension, num_vectors, element_type, k) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Replace both minimum and maximum partition-search bounds.
     Scanner& nprobes(uint32_t nprobes) {
         if (lance_scanner_set_nprobes(handle_.get(), nprobes) != 0) check_error();
