@@ -87,6 +87,10 @@ rank logical rows by the sum of each query subvector's minimum distance to a
 stored subvector. Empty or null outer rows do not rank. Inner vectors must be
 non-nullable; actual stored null or non-finite elements encountered during
 scoring fail the stream. Float types and dimensions must match the column.
+Cosine pairs with zero norm have undefined distance and are ignored. A row is
+excluded if any query subvector has no defined match; a zero-norm query subvector
+therefore produces no results. Column names use Lance field-path syntax,
+including nested paths such as `payload.embeddings` and backtick-quoted names.
 
 L2 is the default on every fragment. Cosine multi-vector indexes are supported
 by the pinned Lance version; incompatible metrics use exact search. Indexed

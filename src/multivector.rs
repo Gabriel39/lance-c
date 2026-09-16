@@ -166,7 +166,7 @@ fn row_distance<T: ArrowPrimitiveType>(
     query: &dyn Array,
     vectors: &FixedSizeListArray,
     metric: DistanceType,
-) -> Result<f32>
+) -> Result<Option<f32>>
 where
     T::Native: L2 + Cosine + Dot + Into<f64>,
 {
@@ -200,15 +200,50 @@ where
             .values()
             .chunks_exact(dimension)
             .map(|vector| distance(query_vector, vector))
-            .min_by(f32::total_cmp)
-            .ok_or_else(|| invalid("cannot score an empty multi-vector row"))?;
+            // Finite zero-norm vectors have undefined cosine distance. Ignore those
+            // pairs; a query with no defined match masks this row, not the whole scan.
+            .filter(|distance| !distance.is_nan())
+            .min_by(f32::total_cmp);
+        let Some(best) = best else {
+            return Ok(None);
+        };
         score += best as f64;
     }
     let score = score as f32;
     if !score.is_finite() {
         return Err(invalid("multi-vector distance is not finite"));
     }
-    Ok(score)
+    Ok(Some(score))
+}
+
+fn vector_column(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
+    if let Some(array) = batch.column_by_name(column) {
+        return Ok(array.clone());
+    }
+    // The planner resolves field paths, including quoted dotted names. Its private
+    // KNN resolver is not exported, so use the same parser and struct traversal here.
+    let parts = lance_core::datatypes::parse_field_path(column)
+        .map_err(|e| invalid(format!("invalid vector column path '{column}': {e}")))?;
+    let root = parts
+        .first()
+        .ok_or_else(|| invalid("empty vector column path"))?;
+    let mut array = batch
+        .column_by_name(root)
+        .cloned()
+        .ok_or_else(|| invalid(format!("missing vector column '{column}'")))?;
+    for part in &parts[1..] {
+        array = array
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .and_then(|parent| parent.column_by_name(part))
+            .cloned()
+            .ok_or_else(|| {
+                invalid(format!(
+                    "missing struct field '{part}' in vector column '{column}'"
+                ))
+            })?;
+    }
+    Ok(array)
 }
 
 fn exact_batch(
@@ -221,9 +256,10 @@ fn exact_batch(
     if batch.num_rows() == 0 {
         return Ok(RecordBatch::new_empty(schema));
     }
-    let vectors = batch
-        .column_by_name(column)
-        .and_then(|a| a.as_any().downcast_ref::<ListArray>())
+    let array = vector_column(&batch, column)?;
+    let vectors = array
+        .as_any()
+        .downcast_ref::<ListArray>()
         .ok_or_else(|| invalid("multi-vector scoring requires a List column"))?;
     let row_ids = batch.column_by_name("_rowid");
     let mut scores = Vec::with_capacity(batch.num_rows());
@@ -250,7 +286,7 @@ fn exact_batch(
             DataType::Float64 => row_distance::<Float64Type>(query.as_ref(), vector, metric),
             _ => Err(invalid("unsupported multi-vector element type")),
         }?;
-        scores.push(Some(score));
+        scores.push(score);
     }
     let mask = BooleanArray::from_iter(scores.iter().map(|score| Some(score.is_some())));
     let distances: ArrayRef = Arc::new(Float32Array::from(scores));

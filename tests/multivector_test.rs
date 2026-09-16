@@ -258,6 +258,15 @@ fn custom_fixture(
     dim: i32,
     indexed: bool,
 ) -> (tempfile::TempDir, CString) {
+    custom_fixture_at(rows, dim, indexed, "vectors")
+}
+
+fn custom_fixture_at(
+    rows: Vec<Vec<Option<f32>>>,
+    dim: i32,
+    indexed: bool,
+    column: &str,
+) -> (tempfile::TempDir, CString) {
     use lance::index::DatasetIndexExt;
     use lance::index::vector::VectorIndexParams;
     use lance_index::IndexType;
@@ -284,15 +293,21 @@ fn custom_fixture(
         None,
     )
     .unwrap();
+    let parts = lance_core::datatypes::parse_field_path(column).unwrap();
+    let mut array: arrow_array::ArrayRef = Arc::new(rows_array);
+    for name in parts[1..].iter().rev() {
+        let field = Arc::new(Field::new(name, array.data_type().clone(), true));
+        array = Arc::new(arrow_array::StructArray::from(vec![(field, array)]));
+    }
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
-        Field::new("vectors", rows_array.data_type().clone(), true),
+        Field::new(&parts[0], array.data_type().clone(), true),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(Int32Array::from_iter_values(1..=rows.len() as i32)),
-            Arc::new(rows_array),
+            array,
         ],
     )
     .unwrap();
@@ -306,7 +321,7 @@ fn custom_fixture(
         .unwrap();
         if indexed {
             ds.create_index(
-                &["vectors"],
+                &[column],
                 IndexType::Vector,
                 None,
                 &VectorIndexParams::ivf_flat(1, MetricType::Cosine),
@@ -639,6 +654,105 @@ fn float16_and_float64_queries_support_all_distance_metrics() {
                 lance_scanner_close(scanner);
             }
             lance_dataset_close(ds);
+        }
+    }
+}
+
+#[test]
+fn cosine_zero_norm_rows_do_not_abort_exact_or_refined_search() {
+    let rows = vec![
+        vec![Some(0.), Some(0.)],
+        vec![Some(1.), Some(0.)],
+        vec![Some(0.), Some(0.), Some(0.), Some(1.)],
+    ];
+    for indexed in [false, true] {
+        let (_dir, uri) = custom_fixture(rows.clone(), 2, indexed);
+        unsafe {
+            let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+            for query in [[1.0f32, 0., 0., 1.], [0., 0., 0., 1.]] {
+                for count in [1, 2] {
+                    let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+                    assert_eq!(
+                        lance_scanner_nearest_multivector(
+                            scan,
+                            c"vectors".as_ptr(),
+                            query.as_ptr().cast(),
+                            2,
+                            count,
+                            0,
+                            3
+                        ),
+                        0
+                    );
+                    assert_eq!(lance_scanner_set_use_index(scan, indexed), 0);
+                    assert_eq!(lance_scanner_set_metric(scan, 1), 0);
+                    assert_eq!(lance_scanner_set_refine_factor(scan, 2), 0);
+                    let mut actual = collect(scan);
+                    actual.sort_by_key(|row| row.0);
+                    let expected = if query[0] == 0. {
+                        vec![]
+                    } else if count == 1 {
+                        vec![(2, 0.), (3, 1.)]
+                    } else {
+                        vec![(2, 1.), (3, 1.)]
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "indexed={indexed}, query={query:?}, count={count}"
+                    );
+                    lance_scanner_close(scan);
+                }
+            }
+            lance_dataset_close(ds);
+        }
+    }
+}
+
+#[test]
+fn nested_and_quoted_columns_support_exact_and_refined_search() {
+    for column in [
+        "payload.vectors",
+        "payload.`vectors.with.dot`",
+        "payload.inner.`vectors.with.dot`",
+    ] {
+        let rows = vec![
+            vec![Some(1.), Some(0.), Some(0.), Some(1.)],
+            vec![Some(2.), Some(0.)],
+            vec![Some(1.), Some(1.)],
+        ];
+        for indexed in [false, true] {
+            let (_dir, uri) = custom_fixture_at(rows.clone(), 2, indexed, column);
+            let column = CString::new(column).unwrap();
+            unsafe {
+                let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+                let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+                assert_eq!(
+                    lance_scanner_nearest_multivector(
+                        scan,
+                        column.as_ptr(),
+                        [1.0f32, 0., 0., 1.].as_ptr().cast(),
+                        2,
+                        2,
+                        0,
+                        3
+                    ),
+                    0
+                );
+                assert_eq!(lance_scanner_set_use_index(scan, indexed), 0);
+                assert_eq!(lance_scanner_set_metric(scan, 1), 0);
+                assert_eq!(lance_scanner_set_refine_factor(scan, 2), 0);
+                let actual = collect(scan);
+                assert_eq!(actual.len(), 3);
+                assert_eq!(
+                    actual.iter().map(|row| row.0).collect::<Vec<_>>(),
+                    vec![1, 3, 2]
+                );
+                assert_eq!(actual[0].1, 0.);
+                assert!((actual[1].1 - (2. - 2.0f32.sqrt())).abs() < 1e-6);
+                assert_eq!(actual[2].1, 1.);
+                lance_scanner_close(scan);
+                lance_dataset_close(ds);
+            }
         }
     }
 }
