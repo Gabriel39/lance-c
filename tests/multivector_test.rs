@@ -297,7 +297,14 @@ fn custom_fixture_at(
     let mut array: arrow_array::ArrayRef = Arc::new(rows_array);
     for name in parts[1..].iter().rev() {
         let field = Arc::new(Field::new(name, array.data_type().clone(), true));
-        array = Arc::new(arrow_array::StructArray::from(vec![(field, array)]));
+        let labels: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![7; rows.len()]));
+        array = Arc::new(arrow_array::StructArray::from(vec![
+            (field, array),
+            (
+                Arc::new(Field::new("label", DataType::Int32, false)),
+                labels,
+            ),
+        ]));
     }
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -754,5 +761,205 @@ fn nested_and_quoted_columns_support_exact_and_refined_search() {
                 lance_dataset_close(ds);
             }
         }
+    }
+}
+
+#[test]
+fn nested_projections_preserve_schema_and_values_in_exact_indexed_and_hybrid_search() {
+    for column in ["payload.vectors", "payload.`vectors.with.dot`"] {
+        for indexed in [false, true] {
+            for appended in [false, true] {
+                let (_dir, uri) = custom_fixture_at(
+                    vec![vec![Some(1.), Some(0.)], vec![Some(0.), Some(1.)]],
+                    2,
+                    indexed,
+                    column,
+                );
+                if appended {
+                    lance_c::runtime::block_on(async {
+                        let mut ds = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+                        let batch = ds.scan().try_into_batch().await.unwrap();
+                        ds.append(
+                            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    });
+                }
+                for projection in [
+                    vec![],
+                    vec!["id"],
+                    vec!["payload.label"],
+                    vec!["id", column],
+                ] {
+                    let expected = lance_c::runtime::block_on(async {
+                        let ds = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+                        let mut scanner = ds.scan();
+                        scanner.scan_in_order(true);
+                        if !projection.is_empty() {
+                            scanner.project(&projection).unwrap();
+                        }
+                        scanner.try_into_batch().await.unwrap()
+                    });
+                    // The appended fragment repeats the same two values; distance order groups
+                    // both exact matches before the orthogonal rows, regardless of tie order.
+                    let indices = arrow_array::UInt32Array::from(if appended {
+                        vec![0, 2, 1, 3]
+                    } else {
+                        vec![0, 1]
+                    });
+                    let expected = RecordBatch::try_new(
+                        expected.schema(),
+                        expected
+                            .columns()
+                            .iter()
+                            .map(|array| {
+                                arrow::compute::take(array.as_ref(), &indices, None).unwrap()
+                            })
+                            .collect(),
+                    )
+                    .unwrap();
+                    unsafe {
+                        let names: Vec<_> = projection
+                            .iter()
+                            .map(|name| CString::new(*name).unwrap())
+                            .collect();
+                        let mut columns: Vec<_> = names.iter().map(|name| name.as_ptr()).collect();
+                        columns.push(ptr::null());
+                        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+                        let scan = lance_scanner_new(
+                            ds,
+                            if projection.is_empty() {
+                                ptr::null()
+                            } else {
+                                columns.as_ptr()
+                            },
+                            ptr::null(),
+                        );
+                        let column = CString::new(column).unwrap();
+                        assert_eq!(
+                            lance_scanner_nearest_multivector(
+                                scan,
+                                column.as_ptr(),
+                                [1.0f32, 0.].as_ptr().cast(),
+                                2,
+                                1,
+                                0,
+                                10
+                            ),
+                            0
+                        );
+                        assert_eq!(lance_scanner_set_use_index(scan, indexed), 0);
+                        assert_eq!(lance_scanner_set_metric(scan, 1), 0);
+                        assert_eq!(lance_scanner_set_batch_size(scan, 1), 0);
+                        let mut stream = FFI_ArrowArrayStream::empty();
+                        assert_eq!(lance_scanner_to_arrow_stream(scan, &mut stream), 0);
+                        let batches = ArrowArrayStreamReader::from_raw(&mut stream)
+                            .unwrap()
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap();
+                        lance_scanner_close(scan);
+                        lance_dataset_close(ds);
+                        let actual =
+                            arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+                        let distances = actual
+                            .column_by_name("_distance")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .unwrap();
+                        assert_eq!(
+                            distances.values().as_ref(),
+                            if appended {
+                                &[0., 0., 1., 1.][..]
+                            } else {
+                                &[0., 1.][..]
+                            }
+                        );
+                        let positions: Vec<_> = actual
+                            .schema()
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, field)| (field.name() != "_distance").then_some(i))
+                            .collect();
+                        assert_eq!(
+                            actual.project(&positions).unwrap(),
+                            expected,
+                            "column={column:?} indexed={indexed} appended={appended} projection={projection:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn strict_batches_apply_after_multivector_offset_and_limit() {
+    let (_dir, uri) = custom_fixture(
+        (1..=6).map(|i| vec![Some(i as f32), Some(0.)]).collect(),
+        2,
+        false,
+    );
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        for batch_size in [Some(2), None] {
+            for (offset, limit) in [(1, 4), (1, 3), (5, 4), (6, 4), (0, 6)] {
+                let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+                assert_eq!(
+                    lance_scanner_nearest_multivector(
+                        scan,
+                        c"vectors".as_ptr(),
+                        [1.0f32, 0.].as_ptr().cast(),
+                        2,
+                        1,
+                        0,
+                        6
+                    ),
+                    0
+                );
+                assert_eq!(lance_scanner_set_use_index(scan, false), 0);
+                if let Some(size) = batch_size {
+                    assert_eq!(lance_scanner_set_batch_size(scan, size), 0);
+                }
+                assert_eq!(lance_scanner_set_strict_batch_size(scan, true), 0);
+                assert_eq!(lance_scanner_set_offset(scan, offset), 0);
+                assert_eq!(lance_scanner_set_limit(scan, limit), 0);
+                let mut stream = FFI_ArrowArrayStream::empty();
+                assert_eq!(lance_scanner_to_arrow_stream(scan, &mut stream), 0);
+                let batches = ArrowArrayStreamReader::from_raw(&mut stream)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                lance_scanner_close(scan);
+                let sizes: Vec<_> = batches.iter().map(RecordBatch::num_rows).collect();
+                let ids: Vec<_> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        b.column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                let expected_ids: Vec<_> =
+                    (1..=6).skip(offset as usize).take(limit as usize).collect();
+                let expected_sizes: Vec<_> = expected_ids
+                    .chunks(batch_size.unwrap_or(8192) as usize)
+                    .map(<[i32]>::len)
+                    .collect();
+                assert_eq!(ids, expected_ids);
+                assert_eq!(
+                    sizes, expected_sizes,
+                    "batch_size={batch_size:?} offset={offset} limit={limit}"
+                );
+            }
+        }
+        lance_dataset_close(ds);
     }
 }

@@ -96,7 +96,8 @@ L2 is the default on every fragment. Cosine multi-vector indexes are supported
 by the pinned Lance version; incompatible metrics use exact search. Indexed
 candidates are refined against stored values (`refine_factor` defaults to 1).
 ANN candidate selection remains approximate. Limit and offset apply after
-restoring distance order, including fragment-scoped searches.
+restoring distance order, including fragment-scoped searches. Strict row batching
+is applied after that final result window, preserving full batches except the last.
 
 Queries accept at most 128 subvectors. Both `num_vectors * k` and
 `refine_factor * k` must be at most 100,000 to bound plan expansion and candidate

@@ -69,6 +69,41 @@ pub(crate) fn rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionP
     })
 }
 
+/// Apply the final distance-ordered window without invalidating output batching.
+pub(crate) fn apply_result_window(
+    plan: Arc<dyn ExecutionPlan>,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_expr::{PhysicalSortExpr, expressions};
+    use datafusion::physical_plan::{
+        coalesce_partitions::CoalescePartitionsExec, limit::GlobalLimitExec, sorts::sort::SortExec,
+    };
+    if plan
+        .downcast_ref::<lance_datafusion::exec::StrictBatchSizeExec>()
+        .is_some()
+    {
+        // Offset can split a previously strict batch. Keep Lance's final rechunker
+        // outside the window, preserving its resolved batch size, including defaults.
+        let input = apply_result_window(plan.children()[0].clone(), offset, limit)?;
+        return plan.with_new_children(vec![input]);
+    }
+    let sort = PhysicalSortExpr {
+        expr: expressions::col("_distance", plan.schema().as_ref())?,
+        options: arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    };
+    // Fragment-scoped payload takes can reorder batches. Restore distance order
+    // before the window; the nearest plan already bounds candidate rows by k.
+    let sorted = Arc::new(SortExec::new(
+        [sort].into(),
+        Arc::new(CoalescePartitionsExec::new(plan)),
+    ));
+    Ok(Arc::new(GlobalLimitExec::new(sorted, offset, limit)))
+}
+
 #[derive(Clone, Debug)]
 enum Scoring {
     Exact {
@@ -395,5 +430,85 @@ pub(crate) fn validate_query(values: &dyn Array) -> Result<()> {
         Err(invalid(
             "multi-vector query must contain only finite, non-null elements",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{Field, Schema};
+    use lance_datafusion::exec::{
+        LanceExecutionOptions, OneShotExec, StrictBatchSizeExec, execute_plan,
+    };
+
+    #[test]
+    fn result_window_preserves_strict_batching_and_distance_order() {
+        crate::runtime::block_on(async {
+            for size in [2, 3] {
+                for (offset, limit) in [
+                    (1, Some(4)),
+                    (1, Some(3)),
+                    (5, Some(4)),
+                    (6, Some(4)),
+                    (1, None),
+                ] {
+                    let schema = Arc::new(Schema::new(vec![Field::new(
+                        "_distance",
+                        DataType::Float32,
+                        false,
+                    )]));
+                    let batches = [[5., 0.], [4., 1.], [3., 2.]]
+                        .into_iter()
+                        .map(|values| {
+                            RecordBatch::try_new(
+                                schema.clone(),
+                                vec![Arc::new(Float32Array::from(values.to_vec()))],
+                            )
+                            .map_err(DataFusionError::from)
+                        })
+                        .collect::<Vec<_>>();
+                    let input = Arc::new(OneShotExec::new(Box::pin(
+                        RecordBatchStreamAdapter::new(schema, stream::iter(batches)),
+                    )));
+                    let plan = Arc::new(StrictBatchSizeExec::new(input, size));
+                    let plan = apply_result_window(plan, offset, limit).unwrap();
+                    let batches: Vec<_> = execute_plan(
+                        plan,
+                        LanceExecutionOptions {
+                            batch_size: Some(2),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                    let actual: Vec<_> = batches
+                        .iter()
+                        .flat_map(|b| {
+                            b.column(0)
+                                .as_any()
+                                .downcast_ref::<Float32Array>()
+                                .unwrap()
+                                .values()
+                                .to_vec()
+                        })
+                        .collect();
+                    let expected: Vec<_> = (0..6)
+                        .skip(offset)
+                        .take(limit.unwrap_or(6))
+                        .map(|i| i as f32)
+                        .collect();
+                    assert_eq!(actual, expected);
+                    assert_eq!(
+                        batches
+                            .iter()
+                            .map(RecordBatch::num_rows)
+                            .collect::<Vec<_>>(),
+                        expected.chunks(size).map(<[f32]>::len).collect::<Vec<_>>()
+                    );
+                }
+            }
+        });
     }
 }

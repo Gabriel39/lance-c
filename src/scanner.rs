@@ -537,27 +537,8 @@ struct PreparedScanner {
 impl PreparedScanner {
     async fn try_into_stream(self) -> Result<DatasetRecordBatchStream> {
         if let Some((offset, limit)) = self.multi_vector_window {
-            use datafusion::physical_expr::{PhysicalSortExpr, expressions};
-            use datafusion::physical_plan::{
-                coalesce_partitions::CoalescePartitionsExec, limit::GlobalLimitExec,
-                sorts::sort::SortExec,
-            };
             let plan = crate::multivector::rewrite(self.scanner.create_plan().await?)?;
-            let sort = PhysicalSortExpr {
-                expr: expressions::col("_distance", plan.schema().as_ref())?,
-                options: arrow::compute::SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            };
-            // Fragment-scoped Lance plans can reorder candidate batches during payload take.
-            // Apply the result window only after restoring distance order across all partitions.
-            // The nearest plan already bounds the candidate rows by k.
-            let sorted = Arc::new(SortExec::new(
-                [sort].into(),
-                Arc::new(CoalescePartitionsExec::new(plan)),
-            ));
-            let plan = Arc::new(GlobalLimitExec::new(sorted, offset, limit));
+            let plan = crate::multivector::apply_result_window(plan, offset, limit)?;
             let stream = lance_datafusion::exec::execute_plan(
                 plan,
                 lance_datafusion::exec::LanceExecutionOptions {
