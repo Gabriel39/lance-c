@@ -22,14 +22,14 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `lance_index::progress::IndexBuildProgress`; already in the graph
 # transitively via lance-index.
 async-trait = "0.1"
-lance = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7", features = ["substrait"] }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7", features = ["substrait"] }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19", features = ["substrait"] }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19", features = ["substrait"] }
 datafusion = { version = "54.0.0", default-features = false }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
@@ -51,9 +51,9 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "356acb0d333c96e970f6f84b97314fc5bc4193f7" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "db211492fc5cd9da5642d7234d9682de9be77c19" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
