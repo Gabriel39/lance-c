@@ -8165,6 +8165,18 @@ fn test_scanner_nearest_segment_prefilter_statistics() {
                                 "unexpected {name} for a complete unfiltered segment"
                             );
                         }
+                    } else {
+                        // An absent metric also sums to zero above. Materializing cases
+                        // must expose both timers, even when their durations are zero.
+                        for name in ["prefilter_build_time", "prefilter_load_time"] {
+                            assert!(
+                                captured.metrics.iter().any(|(metric, kind, _)| {
+                                    metric == name && *kind == LanceScanMetricKind::TimeNanoseconds
+                                }),
+                                "missing prefilter timing: {name}: {:?}",
+                                captured.metrics
+                            );
+                        }
                     }
                     unsafe { lance_scanner_close(scanner) };
                 }
