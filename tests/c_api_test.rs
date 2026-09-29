@@ -7642,6 +7642,19 @@ fn test_scanner_nearest_4bit_pq_prefilter_consistency() {
             rows.sort_by_key(|(id, _)| *id);
             results.push(rows);
             assert_eq!(captured.calls, 1);
+            // Quantized fast-scan and filtered scoring must both report their fused work.
+            for name in ["index_query_prepare_time", "index_distance_topk_time"] {
+                assert!(
+                    captured.metrics.iter().any(|(metric, kind, value)| {
+                        metric == name
+                            && *kind == LanceScanMetricKind::TimeNanoseconds
+                            && *value > 0
+                    }),
+                    "missing PQ timing: {name}: {:?}",
+                    captured.metrics
+                );
+            }
+
             let loads = captured
                 .metrics
                 .iter()
@@ -8096,6 +8109,29 @@ fn test_scanner_nearest_segment_prefilter_statistics() {
                         "stable={stable_row_ids}, segmented={segmented}, filtered={filtered}, tail={include_unindexed}"
                     );
                     assert_eq!(captured.calls, 1);
+                    // Verify the dynamic C metrics retain their time unit and cover warm searches.
+                    for name in [
+                        "ANNSubIndexExec_elapsed_compute",
+                        "index_open_time",
+                        "index_partition_load_time",
+                        "index_partition_prepare_time",
+                        "index_cpu_queue_wait_time",
+                        "index_search_time",
+                        "index_query_prepare_time",
+                        "index_distance_topk_time",
+                        "index_result_materialize_time",
+                    ] {
+                        assert!(
+                            captured.metrics.iter().any(|(metric, kind, value)| {
+                                metric == name
+                                    && *kind == LanceScanMetricKind::TimeNanoseconds
+                                    && *value > 0
+                            }),
+                            "missing ANN timing: {name}: {:?}",
+                            captured.metrics
+                        );
+                    }
+
                     let loads = captured
                         .metrics
                         .iter()
