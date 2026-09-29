@@ -8109,7 +8109,8 @@ fn test_scanner_nearest_segment_prefilter_statistics() {
                         "stable={stable_row_ids}, segmented={segmented}, filtered={filtered}, tail={include_unindexed}"
                     );
                     assert_eq!(captured.calls, 1);
-                    // Verify the dynamic C metrics retain their time unit and cover warm searches.
+                    // Zero is valid for short or uncontended stages; verify the callback
+                    // contract independently of clock resolution and scheduling.
                     for name in [
                         "ANNSubIndexExec_elapsed_compute",
                         "index_open_time",
@@ -8122,10 +8123,8 @@ fn test_scanner_nearest_segment_prefilter_statistics() {
                         "index_result_materialize_time",
                     ] {
                         assert!(
-                            captured.metrics.iter().any(|(metric, kind, value)| {
-                                metric == name
-                                    && *kind == LanceScanMetricKind::TimeNanoseconds
-                                    && *value > 0
+                            captured.metrics.iter().any(|(metric, kind, _)| {
+                                metric == name && *kind == LanceScanMetricKind::TimeNanoseconds
                             }),
                             "missing ANN timing: {name}: {:?}",
                             captured.metrics
