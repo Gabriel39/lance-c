@@ -7718,6 +7718,124 @@ fn test_scanner_nearest_filter_postfilter() {
 }
 
 #[test]
+fn test_scanner_nearest_full_snapshot_prefilter_statistics() {
+    for stable_row_ids in [false, true] {
+        let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, stable_row_ids);
+        let uri = c_str(&uri);
+        let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let column = c_str("embedding");
+        let params = LanceVectorIndexParams {
+            index_type: LanceVectorIndexType::IvfFlat,
+            metric: LanceMetricType::L2,
+            num_partitions: 1,
+            num_sub_vectors: 0,
+            num_bits: 0,
+            max_iterations: 2,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 0,
+        };
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_vector_index(
+                    dataset,
+                    column.as_ptr(),
+                    ptr::null(),
+                    &params,
+                    false,
+                )
+            },
+            0
+        );
+        let mut fragments = [0_u64; 2];
+        assert_eq!(
+            unsafe { lance_dataset_fragment_ids(dataset, fragments.as_mut_ptr()) },
+            0
+        );
+
+        let mut reference_rows_scanned = None;
+        for scope in [None, Some(fragments.as_slice()), Some(&fragments[..1])] {
+            let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+            assert!(!scanner.is_null());
+            if let Some(scope) = scope {
+                assert_eq!(
+                    unsafe { lance_scanner_set_fragment_ids(scanner, scope.as_ptr(), scope.len()) },
+                    0
+                );
+            }
+            let query = [60.0_f32; 8];
+            assert_eq!(
+                unsafe {
+                    lance_scanner_nearest(
+                        scanner,
+                        column.as_ptr(),
+                        query.as_ptr().cast(),
+                        query.len(),
+                        LanceDataType::Float32 as i32,
+                        5,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+            let mut captured = CapturedScanStatistics::default();
+            assert_eq!(
+                unsafe {
+                    lance_scanner_set_statistics_callback(
+                        scanner,
+                        Some(capture_scan_statistics),
+                        (&mut captured as *mut CapturedScanStatistics).cast(),
+                    )
+                },
+                0
+            );
+            let batches = scan_all_rows_from_scanner(scanner);
+            let mut ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(captured.calls, 1);
+            let count = |name: &str| {
+                captured
+                    .metrics
+                    .iter()
+                    .filter(|(key, kind, _)| key == name && *kind == LanceScanMetricKind::Count)
+                    .map(|(_, _, value)| *value)
+                    .sum::<u64>()
+            };
+            if scope.is_some_and(|scope| scope.len() == 1) {
+                assert_eq!(ids, vec![27, 28, 29, 30, 31]);
+                assert_eq!(count("prefilter_input_rows"), 32);
+                assert_eq!(count("prefilter_row_ids"), 32);
+            } else {
+                assert_eq!(ids, vec![58, 59, 60, 61, 62]);
+                assert_eq!(count("prefilter_input_rows"), 0);
+                // Equal results alone would miss a redundant scan of every row ID.
+                let rows_scanned = count("rows_scanned");
+                if let Some(reference) = reference_rows_scanned {
+                    assert_eq!(rows_scanned, reference);
+                } else {
+                    reference_rows_scanned = Some(rows_scanned);
+                }
+            }
+            unsafe { lance_scanner_close(scanner) };
+        }
+        unsafe { lance_dataset_close(dataset) };
+    }
+}
+
+#[test]
 fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
     let uri_c = c_str(&uri);
