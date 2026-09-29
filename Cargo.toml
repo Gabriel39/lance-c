@@ -23,14 +23,14 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # transitively via lance-index.
 async-trait = "0.1"
 # Keep the dependency on the segment-prefilter fix and its float-consistent PQ prerequisite.
-lance = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238", features = ["substrait"] }
-lance-core = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-index = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-io = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-table = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238", features = ["substrait"] }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8", features = ["substrait"] }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-linalg = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-table = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8", features = ["substrait"] }
 datafusion = { version = "54.0.0", default-features = false }
 arrow = { version = "58.0.0", features = ["prettyprint", "ffi"] }
 arrow-array = "58.0.0"
@@ -52,9 +52,9 @@ snafu = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-lance = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238", features = ["substrait"] }
-lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
-lance-file = { git = "https://github.com/lance-format/lance.git", rev = "84b52cc89b47219fe219f4d764ba98d07ebca238" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8", features = ["substrait"] }
+lance-datagen = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "9139475416d79acad1899cf284e852283eb2eee8" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"

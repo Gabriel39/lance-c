@@ -7510,6 +7510,155 @@ fn test_scanner_nearest_with_ivf_pq_index() {
 }
 
 #[test]
+fn test_scanner_nearest_4bit_pq_prefilter_consistency() {
+    for metric in [
+        LanceMetricType::L2,
+        LanceMetricType::Cosine,
+        LanceMetricType::Dot,
+    ] {
+        // One 512-row partition exercises the bulk scoring path whose former
+        // quantized scores could select different candidates from an all-row mask.
+        let (_tmp, uri) = create_vector_dataset(512, 32);
+        let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let column = c_str("embedding");
+        let name = c_str("pq_idx");
+        let params = LanceVectorIndexParams {
+            index_type: LanceVectorIndexType::IvfPq,
+            metric,
+            num_partitions: 1,
+            num_sub_vectors: 8,
+            num_bits: 4,
+            max_iterations: 2,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 16,
+        };
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_vector_index(
+                    dataset,
+                    column.as_ptr(),
+                    name.as_ptr(),
+                    &params,
+                    false,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut segment = [0_u8; 16];
+        let mut count = 0;
+        assert_eq!(
+            unsafe {
+                lance_dataset_index_segments(
+                    dataset,
+                    name.as_ptr(),
+                    segment.as_mut_ptr(),
+                    1,
+                    &mut count,
+                )
+            },
+            0
+        );
+        assert_eq!(count, 1);
+        let mut results = Vec::new();
+        for has_filter in [false, true] {
+            let filter = c_str("id >= 0");
+            let scanner = unsafe {
+                lance_scanner_new(
+                    dataset,
+                    ptr::null(),
+                    if has_filter {
+                        filter.as_ptr()
+                    } else {
+                        ptr::null()
+                    },
+                )
+            };
+            assert!(!scanner.is_null());
+            let fragment = 0_u64;
+            assert_eq!(
+                unsafe { lance_scanner_set_fragment_ids(scanner, &fragment, 1) },
+                0
+            );
+            assert_eq!(
+                unsafe { lance_scanner_set_index_segments(scanner, segment.as_ptr(), 1) },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+            let query = [0.5_f32; 32];
+            assert_eq!(
+                unsafe {
+                    lance_scanner_nearest(
+                        scanner,
+                        column.as_ptr(),
+                        query.as_ptr().cast(),
+                        query.len(),
+                        LanceDataType::Float32 as i32,
+                        10,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 1) }, 0);
+            let mut captured = CapturedScanStatistics::default();
+            assert_eq!(
+                unsafe {
+                    lance_scanner_set_statistics_callback(
+                        scanner,
+                        Some(capture_scan_statistics),
+                        (&mut captured as *mut CapturedScanStatistics).cast(),
+                    )
+                },
+                0
+            );
+            let batches = scan_all_rows_from_scanner(scanner);
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let distances = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                rows.extend(
+                    ids.values()
+                        .iter()
+                        .copied()
+                        .zip(distances.values().iter().copied()),
+                );
+            }
+            assert_eq!(rows.len(), 10);
+            assert!(rows.iter().all(|(_, distance)| distance.is_finite()));
+            // Tie order is unspecified; compare candidate IDs and their PQ scores.
+            rows.sort_by_key(|(id, _)| *id);
+            results.push(rows);
+            assert_eq!(captured.calls, 1);
+            let loads = captured
+                .metrics
+                .iter()
+                .filter(|(name, kind, _)| {
+                    name == "prefilter_loads" && *kind == LanceScanMetricKind::Count
+                })
+                .map(|(_, _, value)| *value)
+                .sum::<u64>();
+            assert_eq!(loads, u64::from(has_filter));
+            unsafe { lance_scanner_close(scanner) };
+        }
+        assert_eq!(results[0], results[1]);
+        unsafe { lance_dataset_close(dataset) };
+    }
+}
+
+#[test]
 fn test_scanner_adaptive_nprobes_and_approx_mode_validation_and_lifecycle() {
     let (_tmp, uri) = create_test_dataset();
     let uri_c = c_str(&uri);
