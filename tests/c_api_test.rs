@@ -7836,6 +7836,161 @@ fn test_scanner_nearest_full_snapshot_prefilter_statistics() {
 }
 
 #[test]
+fn test_scanner_nearest_segment_prefilter_statistics() {
+    for stable_row_ids in [false, true] {
+        for segmented in [true, false] {
+            let (_tmp, uri) = create_multi_fragment_vector_dataset(3, 64, 8, stable_row_ids);
+            let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+            assert!(!dataset.is_null());
+            let covered = if segmented { vec![0] } else { vec![0, 1] };
+            let first = build_vector_segment_bytes(dataset, LanceMetricType::L2, &covered);
+            let uuid = segment_uuid(first.as_ptr(), first.len());
+            if segmented {
+                let second = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[1]);
+                assert_eq!(commit_vector_segments(dataset, &[&first, &second]), 0);
+            } else {
+                assert_eq!(commit_vector_segments(dataset, &[&first]), 0);
+            }
+            let mut deleted = 0;
+            assert_eq!(
+                unsafe { lance_dataset_delete(dataset, c_str("id = 7").as_ptr(), &mut deleted) },
+                0
+            );
+            assert_eq!(deleted, 1);
+            for include_unindexed in [false, true] {
+                for filtered in [false, true] {
+                    let filter = c_str("id >= 32");
+                    let scanner = unsafe {
+                        lance_scanner_new(
+                            dataset,
+                            ptr::null(),
+                            if filtered {
+                                filter.as_ptr()
+                            } else {
+                                ptr::null()
+                            },
+                        )
+                    };
+                    assert!(!scanner.is_null());
+                    // Keep the ANN scope narrower than the snapshot, optionally adding a flat-search tail.
+                    let fragments = if include_unindexed {
+                        vec![0_u64, 2]
+                    } else {
+                        vec![0_u64]
+                    };
+                    assert_eq!(
+                        unsafe {
+                            lance_scanner_set_fragment_ids(
+                                scanner,
+                                fragments.as_ptr(),
+                                fragments.len(),
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(
+                        unsafe { lance_scanner_set_index_segments(scanner, uuid.as_ptr(), 1) },
+                        0
+                    );
+                    assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+                    let query = [0.0_f32; 8];
+                    assert_eq!(
+                        unsafe {
+                            lance_scanner_nearest(
+                                scanner,
+                                c_str("embedding").as_ptr(),
+                                query.as_ptr().cast(),
+                                query.len(),
+                                LanceDataType::Float32 as i32,
+                                256,
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+                    let mut captured = CapturedScanStatistics::default();
+                    assert_eq!(
+                        unsafe {
+                            lance_scanner_set_statistics_callback(
+                                scanner,
+                                Some(capture_scan_statistics),
+                                (&mut captured as *mut CapturedScanStatistics).cast(),
+                            )
+                        },
+                        0
+                    );
+                    let batches = scan_all_rows_from_scanner(scanner);
+                    let mut ids = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column_by_name("id")
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap()
+                                .values()
+                                .to_vec()
+                        })
+                        .collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    let expected = (0..64)
+                        .chain(if include_unindexed {
+                            128..192
+                        } else {
+                            128..128
+                        })
+                        .filter(|id| *id != 7 && (!filtered || *id >= 32))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        ids, expected,
+                        "stable={stable_row_ids}, segmented={segmented}, filtered={filtered}, tail={include_unindexed}"
+                    );
+                    assert_eq!(captured.calls, 1);
+                    let loads = captured
+                        .metrics
+                        .iter()
+                        .filter(|(name, kind, _)| {
+                            name == "prefilter_loads" && *kind == LanceScanMetricKind::Count
+                        })
+                        .map(|(_, _, value)| *value)
+                        .sum::<u64>();
+                    // Correct rows alone do not detect rebuilding the complete segment allowlist.
+                    assert_eq!(
+                        loads,
+                        u64::from(filtered || !segmented),
+                        "stable={stable_row_ids}, segmented={segmented}, filtered={filtered}, tail={include_unindexed}"
+                    );
+                    if segmented && !filtered {
+                        // These counters expose the row-ID materialization cost independently
+                        // of the index search and deletion-mask work that must still execute.
+                        for name in [
+                            "prefilter_input_rows",
+                            "prefilter_row_ids",
+                            "prefilter_build_time",
+                            "prefilter_load_time",
+                        ] {
+                            let value = captured
+                                .metrics
+                                .iter()
+                                .filter(|(key, _, _)| key == name)
+                                .map(|(_, _, value)| *value)
+                                .sum::<u64>();
+                            assert_eq!(
+                                value, 0,
+                                "unexpected {name} for a complete unfiltered segment"
+                            );
+                        }
+                    }
+                    unsafe { lance_scanner_close(scanner) };
+                }
+            }
+            unsafe { lance_dataset_close(dataset) };
+        }
+    }
+}
+
+#[test]
 fn test_scanner_nearest_prefilter_with_fragment_ids_next() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
     let uri_c = c_str(&uri);
