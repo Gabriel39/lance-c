@@ -143,6 +143,56 @@ Queries accept at most 128 subvectors. Both `num_vectors * k` and
 `refine_factor * k` must be at most 100,000 to bound plan expansion and candidate
 allocation. The existing single-vector API and its defaults are unchanged.
 
+## Batch nearest-neighbor search
+
+Use `lance_scanner_nearest_batch` or `Scanner::nearest_batch` to search a
+`FixedSizeList<T, dimension>` column with independent query vectors:
+
+```cpp
+const float queries[] = {1.0f, 0.0f, 0.0f, 1.0f};
+auto scanner = dataset.scan();
+scanner.nearest_batch("embedding", queries, 2, 2, 10)
+       .use_index(false);
+```
+
+Here there are two queries of dimension two, each returning up to ten rows.
+The result includes the zero-based `query_index` (`int32`) and `_distance`,
+alongside the requested dataset columns. A batch of one query still includes
+`query_index`. Duplicate query vectors retain distinct indices; queries with no
+matching rows produce no result rows. Result row order is not part of the API contract.
+
+This differs from `nearest_multivector`: that API scores one logical query
+against a `List<FixedSizeList<...>>` column and returns one ranked result set.
+Batch input requires a fixed-size vector column and rejects a dataset with a
+reserved `query_index` column. Float16, Float32, Float64, and UInt8 are accepted;
+the query element type must match the column. UInt8 uses the Hamming metric.
+Floating-point query values must be finite. Values are copied before the setter
+returns, so the caller can immediately release its input buffer.
+
+Configure the query before scanning. Successful nearest-query setters replace
+the previous query; an invalid batch request leaves it unchanged. FTS and
+nearest queries remain mutually exclusive. Distance ranges currently require a
+single-vector query; replacing it with a batch clears its bounds. All queries
+share the scanner's metric, filter, index selection, and tuning parameters.
+Existing prefilter and postfilter semantics apply; postfiltering can return
+fewer than `k` rows.
+
+The scanner's global `limit` and `offset` settings are rejected in batch mode,
+in either configuration order: they cannot represent independent result windows.
+For per-query pagination, request enough candidates with `k` and apply the window
+separately to each `query_index` in the caller.
+
+Bounds are 128 queries, 64 MiB of copied query values, and 100,000 candidates for
+`num_queries * k * refine_factor` (use 1 when refinement is unset). Explicit
+refinement must be positive. These bounds do not cap total index/payload memory;
+callers should also configure scanner resource controls. Arrow streams use the
+existing ownership and cancellation contract, including early stream release.
+
+Execution delegates to the pinned Lance scanner. Flat search can share data
+scans. Eligible IVF queries can share partition scans; HNSW, refinement, adaptive
+partition probing, and other ineligible plans use Lance's per-query fallback.
+The batch API does not guarantee shared execution or a particular speedup.
+
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.

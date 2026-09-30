@@ -2131,7 +2131,7 @@ int32_t lance_scanner_nearest(
  * Call after lance_scanner_nearest and before starting the scan. Both bounds
  * are copied before returning; NULL means unbounded on that side. Passing NULL
  * for both clears the range. A successful replacement nearest query also clears
- * the range. Multi-vector queries and scans without nearest are rejected.
+ * the range. Batch/multi-vector queries and scans without nearest are rejected.
  *
  * Bounds must be finite; negative distances are allowed. When both are present,
  * lower_bound must be strictly smaller than upper_bound. Invalid calls leave the
@@ -2148,6 +2148,33 @@ int32_t lance_scanner_set_distance_range(
     LanceScanner* scanner,
     const float* lower_bound,
     const float* upper_bound
+);
+
+/**
+ * Set independent k-NN queries on a FixedSizeList<element_type, dimension> column.
+ * query_data contains dimension * num_queries aligned, row-major elements, copied
+ * before returning. Supported element types: Float16/32/64 and UInt8 (Hamming).
+ * Floating-point values must be finite and the type/dimension must match the column.
+ *
+ * Every query returns up to k rows with a zero-based int32 query_index column and
+ * _distance, including batches of one query. Duplicate queries retain separate
+ * indices. A dataset column named query_index is rejected. No output row order
+ * is guaranteed. Index, metric, filter and search settings are shared by all queries.
+ *
+ * dimension and k must be positive; num_queries must be in 1..=128. Copied values
+ * are bounded to 64 MiB; num_queries * k * refine_factor must be <= 100000, using
+ * 1 when refinement is unset. Explicit refinement must be positive. These are
+ * request bounds, not a total index/payload-memory limit.
+ *
+ * Must be configured before scanning. Replaces a previous nearest query atomically;
+ * an invalid request preserves it. Mutually exclusive with FTS and global scanner
+ * limit/offset, in either configuration order. Apply per-query windows in the caller.
+ * Streams retain the existing ownership, error and early-release/cancellation contract.
+ * Returns 0 on success, -1 on error; use lance_last_error_code/message for details.
+ */
+int32_t lance_scanner_nearest_batch(
+    LanceScanner* scanner, const char* column, const void* query_data,
+    size_t dimension, size_t num_queries, LanceDataType element_type, uint32_t k
 );
 
 /**

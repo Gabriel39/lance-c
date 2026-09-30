@@ -1271,6 +1271,75 @@ static void test_distance_range(const std::string& uri) {
     PASS();
 }
 
+static void check_batch_nearest_results(struct ArrowArrayStream *stream) {
+    ArrowSchema schema{};
+    assert(stream->get_schema(stream, &schema) == 0);
+    int query_column = -1, id_column = -1, distance_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "query_index") == 0) {
+            query_column = (int)i;
+        }
+        if (strcmp(schema.children[i]->name, "id") == 0) id_column = (int)i;
+        if (strcmp(schema.children[i]->name, "_distance") == 0) distance_column = (int)i;
+    }
+    assert(query_column >= 0);
+    assert(strcmp(schema.children[query_column]->format, "i") == 0);
+    assert(id_column >= 0 && distance_column >= 0);
+    schema.release(&schema);
+    int counts[2] = {0, 0};
+    int seen[2] = {0, 0};
+    while (1) {
+        ArrowArray batch{};
+        assert(stream->get_next(stream, &batch) == 0);
+        if (!batch.release) break;
+        struct ArrowArray *queries = batch.children[query_column];
+        const int32_t *values = (const int32_t *)queries->buffers[1];
+        struct ArrowArray *ids = batch.children[id_column];
+        struct ArrowArray *distances = batch.children[distance_column];
+        const int32_t *id_values = (const int32_t *)ids->buffers[1];
+        const float *distance_values = (const float *)distances->buffers[1];
+        for (int64_t i = 0; i < batch.length; ++i) {
+            int32_t index = values[queries->offset + i];
+            assert(index >= 0 && index < 2);
+            int32_t id = id_values[ids->offset + i];
+            int32_t first_id = index == 0 ? 1 : 19;
+            assert(id >= first_id && id <= first_id + 1);
+            seen[index] |= 1 << (id - first_id);
+            float expected = (id == 1 || id == 20) ? 0.0f : 0.08f;
+            float error = distance_values[distances->offset + i] - expected;
+            assert(error > -0.0001f && error < 0.0001f);
+            ++counts[index];
+        }
+        batch.release(&batch);
+    }
+    assert(counts[0] == 2 && counts[1] == 2);
+    assert(seen[0] == 3 && seen[1] == 3);
+    stream->release(stream);
+}
+
+static void test_batch_nearest(const std::string& uri) {
+    TEST(test_batch_nearest);
+    float queries[16];
+    for (int i = 0; i < 8; ++i) {
+        queries[i] = 0.1f + i;
+        queries[8 + i] = 2.0f + i;
+    }
+    auto dataset = lance::Dataset::open(uri);
+    for (bool typed : {false, true}) {
+        auto scanner = dataset.scan();
+        if (typed) {
+            scanner.nearest_batch("embedding", queries, 8, 2, LANCE_DTYPE_FLOAT32, 2);
+        } else {
+            scanner.nearest_batch("embedding", queries, 8, 2, 2);
+        }
+        scanner.use_index(false).batch_size(1);
+        ArrowArrayStream stream = {};
+        scanner.to_arrow_stream(&stream);
+        check_batch_nearest_results(&stream);
+    }
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
@@ -1297,6 +1366,7 @@ int main(int argc, char** argv) {
     test_restore_to_current(uri);
     test_error_exception(uri);
     test_index_lifecycle(uri);
+    test_batch_nearest(uri);
     test_nearest_smoke(uri);
     test_multivector_rejects_flat_column(uri);
     test_index_segments_smoke(uri);
