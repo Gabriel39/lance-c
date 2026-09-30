@@ -147,6 +147,13 @@ typedef enum {
     LANCE_METRIC_HAMMING = 3,
 } LanceMetricType;
 
+/** Speed / accuracy tradeoff for approximate vector search. */
+typedef enum {
+    LANCE_APPROX_MODE_FAST     = 0,
+    LANCE_APPROX_MODE_NORMAL   = 1,
+    LANCE_APPROX_MODE_ACCURATE = 2,
+} LanceApproxMode;
+
 typedef enum {
     LANCE_DTYPE_FLOAT32 = 0,
     LANCE_DTYPE_FLOAT16 = 1,
@@ -187,6 +194,7 @@ typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
 typedef struct LanceFtsQueryContext LanceFtsQueryContext;
+typedef struct LanceBlobFile LanceBlobFile;
 
 /* ─── Shared session ─── */
 
@@ -979,6 +987,180 @@ int32_t lance_dataset_take_rows(
     struct ArrowArrayStream* out
 );
 
+/* ─── Blob v2 random access ─── */
+
+/*
+ * A LanceBlobFile is a file-like handle over one value of a Blob v2 column,
+ * returned by lance_dataset_take_blobs() / lance_dataset_take_blobs_by_indices()
+ * and released with lance_blob_file_close(). It owns what it needs to read,
+ * so it stays valid after the dataset is closed. Not thread-safe per handle;
+ * distinct handles are independent.
+ *
+ * Reads are cursor-based: the cursor starts at 0, lance_blob_file_read() and
+ * lance_blob_file_read_up_to() advance it, lance_blob_file_read_range() does
+ * not, lance_blob_file_seek() sets it.
+ */
+
+/**
+ * Take blob handles by dataset row ID.
+ *
+ * Row IDs are values from the `_rowid` scanner column, not zero-based row
+ * offsets. They must belong to the same dataset snapshot used for this read.
+ *
+ * On success `out[i]` holds the handle for `row_ids[i]`, or NULL when that
+ * blob value is null (an empty blob is a handle of size 0). The caller closes
+ * every non-NULL handle exactly once. On failure `out` is left untouched; a
+ * row ID that does not resolve fails the whole call.
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param row_ids      Array of dataset row IDs. May be NULL only when
+ *                     `num_row_ids` is zero.
+ * @param num_row_ids  Length of `row_ids`. Zero is a no-op that succeeds
+ *                     without writing to `out`.
+ * @param column       Name of a Blob v2 column. Must not be NULL. A missing
+ *                     column, or a column that is not a blob column, is an
+ *                     error.
+ * @param out          Caller-allocated array of at least `num_row_ids`
+ *                     handle pointers. Must not be NULL.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_take_blobs(
+    const LanceDataset* dataset,
+    const uint64_t* row_ids,
+    size_t num_row_ids,
+    const char* column,
+    LanceBlobFile** out
+);
+
+/**
+ * Take blob handles by row index.
+ *
+ * Row indices are 0-based offsets in the dataset, as used by
+ * lance_dataset_take(). Ownership, ordering, NULL slots, and failure
+ * behavior are identical to lance_dataset_take_blobs().
+ *
+ * @param dataset      Open dataset snapshot.
+ * @param indices      Array of 0-based row offsets. May be NULL only when
+ *                     `num_indices` is zero.
+ * @param num_indices  Length of `indices`. Zero is a no-op that succeeds
+ *                     without writing to `out`.
+ * @param column       Name of a Blob v2 column. Must not be NULL.
+ * @param out          Caller-allocated array of at least `num_indices`
+ *                     handle pointers. Must not be NULL.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_take_blobs_by_indices(
+    const LanceDataset* dataset,
+    const uint64_t* indices,
+    size_t num_indices,
+    const char* column,
+    LanceBlobFile** out
+);
+
+/**
+ * Return the size of the blob in bytes.
+ *
+ * Metadata carried by the handle: no storage access, independent of the
+ * cursor, still available after lance_dataset_close().
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @return The blob size, or 0 on error. A return of 0 may be an empty blob
+ *         or an error; check lance_last_error_code() to tell them apart.
+ */
+uint64_t lance_blob_file_size(const LanceBlobFile* blob);
+
+/**
+ * Read from the current cursor to the end of the blob.
+ *
+ * With the cursor at 0 that is the whole blob. The cursor ends up at the end.
+ * `dst` must hold every remaining byte; a smaller buffer is an error and
+ * reads nothing. At or past the end this writes nothing and succeeds.
+ *
+ * @param blob     Blob handle. NULL is an error.
+ * @param dst      Destination buffer. May be NULL only when no bytes remain
+ *                 from the current cursor.
+ * @param dst_len  Capacity of `dst` in bytes. Must be at least the number of
+ *                 bytes remaining from the cursor, or 0 if the cursor is at
+ *                 or past the end.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read(LanceBlobFile* blob, uint8_t* dst, size_t dst_len);
+
+/**
+ * Read at most `len` bytes from the current cursor.
+ *
+ * Reads `min(len, size - cursor)` bytes and advances the cursor past them,
+ * so repeated calls walk the blob. At or past the end this writes no bytes,
+ * stores 0 in `*bytes_read`, and succeeds.
+ *
+ * @param blob        Blob handle. NULL is an error.
+ * @param dst         Destination buffer. May be NULL only when `len` is zero.
+ * @param len         Maximum number of bytes to read.
+ * @param bytes_read  Receives the number of bytes actually written to `dst`,
+ *                    never more than `len`. Must not be NULL. Written only on
+ *                    success.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read_up_to(
+    LanceBlobFile* blob,
+    uint8_t* dst,
+    size_t len,
+    size_t* bytes_read
+);
+
+/**
+ * Read exactly `len` bytes starting at `offset`, without moving the cursor.
+ *
+ * `offset` is blob-relative. A non-empty range that ends past the blob size,
+ * or an `offset` plus `len` that overflows 64 bits, is an error; `len` 0
+ * succeeds without checking `offset`. Nothing is written to `dst` on error.
+ *
+ * @param blob    Blob handle. NULL is an error.
+ * @param offset  Byte offset from the start of the blob.
+ * @param dst     Destination buffer of at least `len` bytes. May be NULL only
+ *                when `len` is zero.
+ * @param len     Number of bytes to read. Zero is a no-op that succeeds.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_read_range(
+    const LanceBlobFile* blob,
+    uint64_t offset,
+    uint8_t* dst,
+    size_t len
+);
+
+/**
+ * Move the cursor to `pos`.
+ *
+ * Seeking past the end of the blob is allowed, mirroring the underlying Lance
+ * API; a subsequent read then returns zero bytes.
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @param pos   New cursor position, in bytes from the start of the blob.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos);
+
+/**
+ * Report the current cursor position.
+ *
+ * @param blob  Blob handle. NULL is an error.
+ * @param pos   Receives the cursor position in bytes from the start of the
+ *              blob. Must not be NULL. Written only on success.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos);
+
+/**
+ * Close a blob handle and free it.
+ *
+ * Call exactly once per non-NULL handle; the handle is invalid afterwards.
+ * NULL is a no-op. Never fails and leaves the pending error untouched.
+ *
+ * @param blob  Blob handle, or NULL.
+ */
+void lance_blob_file_close(LanceBlobFile* blob);
+
 /* ─── Scanner builder ─── */
 
 /**
@@ -1002,7 +1184,8 @@ int32_t lance_scanner_set_batch_size(LanceScanner* scanner, int64_t batch_size);
  * Set the target output batch size in bytes.
  *
  * When set, this takes precedence over the row-based batch size. The value
- * must be greater than zero and must be set before scanning starts.
+ * must be greater than zero and must be set before scanning starts. The call
+ * is rejected without changing scanner state if strict batch sizing is enabled.
  */
 int32_t lance_scanner_set_batch_size_bytes(
     LanceScanner* scanner,
@@ -1065,7 +1248,92 @@ int32_t lance_scanner_set_target_parallelism(
  * they are ready.
  */
 int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool scan_in_order);
+
+/**
+ * Configure whether scalar indices may be used to optimize filters.
+ *
+ * Scalar indices are enabled by default. Disable this to force filter
+ * evaluation without scalar indices, including an explicitly selected scalar
+ * segment (which falls back to a scan of its explicit fragment_ids).
+ * This setting is independent of
+ * `lance_scanner_set_use_index`, which controls vector ANN index usage.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_use_scalar_index(
+    LanceScanner* scanner,
+    bool use_scalar_index
+);
+
+/**
+ * Configure whether row-based output batches are strict.
+ *
+ * When enabled, every batch except the last has exactly the configured row
+ * batch size. This may require copying and cannot be combined with a byte-based
+ * batch-size limit. The call is rejected without changing scanner state if a
+ * byte limit is already set. Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_strict_batch_size(
+    LanceScanner* scanner,
+    bool strict_batch_size
+);
+
+/**
+ * Configure whether file statistics may optimize the scan (default: true).
+ * Intended primarily for debugging and benchmarking. Must be set before
+ * scanning starts.
+ */
+int32_t lance_scanner_set_use_stats(LanceScanner* scanner, bool use_stats);
+
 int32_t lance_scanner_with_row_id(LanceScanner* scanner, bool enable);
+
+/** Include or omit the `_rowaddr` metadata column. Must be set before scanning. */
+int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable);
+
+/**
+ * Configure whether deleted rows still present in storage are returned.
+ * Requires with_row_id=true; deleted rows have a NULL `_rowid`.
+ * For filtered scans, also set use_scalar_index=false: indices built after a
+ * deletion may omit tombstoned rows. Incompatible with scalar_index_segment,
+ * even when scalar indices are disabled.
+ * Fragments removed from the current snapshot are not scanned.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_include_deleted_rows(
+    LanceScanner* scanner,
+    bool include_deleted_rows
+);
+
+/** How blob columns are materialized by a scan. Validated as an integer. */
+typedef enum {
+    /**
+     * Default: blob columns are returned as descriptor structs and every
+     * other binary column is returned as bytes. The descriptor layout
+     * depends on the storage format of the column: Blob v2 columns yield
+     * (kind, position, size, blob_id, blob_uri), while legacy blob columns
+     * (large_binary tagged `lance-encoding: blob`) yield (position, size).
+     */
+    LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS = 0,
+    /** Every blob column is materialized as bytes (LargeBinary). */
+    LANCE_BLOB_HANDLING_ALL_BINARY = 1,
+    /**
+     * Requests descriptors for every binary column. On lance v11.0.0 only
+     * columns carrying blob metadata are affected; other binary columns keep
+     * their bytes, so this behaves like
+     * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS.
+     */
+    LANCE_BLOB_HANDLING_ALL_DESCRIPTIONS = 2,
+} LanceBlobHandling;
+
+/**
+ * Choose how blob columns are materialized by this scan. Default:
+ * LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS. ALL_BINARY pulls the full payload
+ * into the batches, so keep descriptors for large values. Columns without
+ * blob metadata keep their bytes under every mode.
+ *
+ * Must be set before scanning starts; values outside the enum are rejected.
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_scanner_set_blob_handling(LanceScanner* scanner, LanceBlobHandling handling);
 
 /**
  * Restrict scan to the given fragment IDs. Must be called before iteration.
@@ -1611,6 +1879,88 @@ int32_t lance_index_segment_builder_execute_uncommitted(
     size_t* out_len
 );
 
+/**
+ * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
+ * argument. Exactly one stage is active at a time: a stage's
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
+ * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
+ */
+typedef enum {
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
+} LanceIndexBuildProgressEvent;
+
+/**
+ * Receives index build progress events while
+ * lance_index_segment_builder_execute_uncommitted runs.
+ *
+ * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
+ * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
+ * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
+ *
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
+ *    `total` is the number of work units (0 = unknown), `unit` describes what
+ *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
+ *    and `completed` is 0.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
+ *    and `completed` is the number of units completed so far.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
+ *    and `completed` is 0.
+ *
+ * Stage names are index-type-specific (e.g. "train_ivf", "shuffle",
+ * "merge_partitions" for vector indices; "load_data" for scalar indices) and
+ * are diagnostic-only: they are not a stable cross-version contract, so
+ * consumers must treat them as opaque strings.
+ *
+ * The callback is invoked from lance-c's internal tokio runtime worker
+ * threads. Certain stages report progress concurrently from parallel worker
+ * tasks, so the callback MUST be thread-safe and reentrant. It must be
+ * non-blocking and must not call back into any `lance_*` function (no
+ * reentrancy).
+ *
+ * The callback is invoked without a panic guard: it must return normally,
+ * because unwinding or throwing across this boundary can abort the host
+ * process. The callback cannot abort the build; progress reporting is
+ * advisory and diagnostic and cannot affect the build outcome.
+ */
+typedef void (*LanceIndexBuildProgressCallback)(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed
+);
+
+/**
+ * Register the index-build progress callback for a segment builder.
+ *
+ * Must be called before the builder is executed; the builder is single-use,
+ * so calling it after lance_index_segment_builder_execute_uncommitted has
+ * been called (even if that call failed) returns -1. `callback` must not be
+ * NULL. `callback_ctx` may be NULL and is passed through to the callback
+ * opaquely. Setting a callback replaces any previously set callback.
+ *
+ * Invocations occur only while lance_index_segment_builder_execute_uncommitted
+ * is executing, and this is enforced rather than contractual: lance-c
+ * disables the callback and drains in-flight invocations through a retirement
+ * gate before that call returns, including on error, so a worker task
+ * detached by lance core on an error path can never invoke the callback
+ * afterwards. `callback` and `callback_ctx` must therefore remain valid and
+ * safe to invoke until lance_index_segment_builder_execute_uncommitted
+ * returns. See LanceIndexBuildProgressCallback for the full threading and
+ * reentrancy contract.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_builder_set_progress_callback(
+    LanceIndexSegmentBuilder* builder,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx
+);
+
 /** Free metadata bytes returned by an uncommitted segment build. NULL-safe. */
 void lance_free_bytes(uint8_t* bytes);
 
@@ -1712,6 +2062,58 @@ int32_t lance_index_segment_metadata_fragment_ids(
 /** Free parsed segment metadata. NULL-safe. */
 void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata);
 
+/**
+ * Commit previously built uncommitted index segments as one logical index.
+ *
+ * `segment_metadata_bytes[i]` must point to
+ * `segment_metadata_lens[i]` bytes of protobuf-encoded IndexMetadata produced
+ * by lance_index_segment_builder_execute_uncommitted() (typically built on
+ * distributed workers). All segments are registered under `index_name` on
+ * `column` in a single commit, so the dataset version increases by exactly
+ * one on success.
+ *
+ * The segment set is validated by the Lance core and rejected with
+ * LANCE_ERR_INVALID_ARGUMENT when it is empty, contains duplicate segment
+ * UUIDs, or has overlapping fragment coverage. All segments must share one
+ * index type, and the commit fails if `column` does not exist. Every segment
+ * must declare `column` as its keyed field — that is, have been built for
+ * `column` — or the commit fails with LANCE_ERR_INVALID_ARGUMENT.
+ * Vector segments that will coexist (incoming segments and retained existing
+ * segments) must have compatible distance metrics, dimensions, sub-index
+ * types, and quantizer kinds. Independently trained IVF centroids and PQ
+ * codebooks may differ. Incompatible segments are rejected with
+ * LANCE_ERR_INVALID_ARGUMENT without changing the dataset version or index.
+ *
+ * Replacement is automatic and coverage-driven — there is no replace flag:
+ * existing same-name segments of the same index type whose fragment coverage
+ * is fully covered by the incoming set are replaced, while existing segments
+ * covering disjoint fragments are retained as additional deltas of the
+ * logical index. A commit that would orphan fragments from an existing
+ * segment (partial overlap) is rejected. A commit whose index type differs
+ * from the existing same-name index replaces that index entirely, and
+ * therefore requires the incoming segments to cover every current fragment;
+ * a partial-coverage type change is rejected with LANCE_ERR_INVALID_ARGUMENT.
+ * Vector compatibility is checked after selecting replacements, so a complete
+ * replacement may change the metric without conflicting with removed segments.
+ *
+ * @param dataset    Open dataset (mutated; same handle remains valid).
+ * @param index_name Logical index name; must not be NULL or empty.
+ * @param column     Indexed column; must not be NULL or empty.
+ * @param segment_metadata_bytes Array of pointers to encoded IndexMetadata.
+ * @param segment_metadata_lens  Array of byte lengths, parallel to
+ *                               segment_metadata_bytes.
+ * @param segment_count          Number of segments; must be > 0.
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_dataset_commit_index_segments(
+    LanceDataset* dataset,
+    const char* index_name,
+    const char* column,
+    const uint8_t* const* segment_metadata_bytes,
+    const size_t* segment_metadata_lens,
+    size_t segment_count
+);
+
 /** Drop an index by name. Returns -1 (NOT_FOUND) if no such index. */
 int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name);
 
@@ -1786,7 +2188,62 @@ int32_t lance_scanner_nearest(
     uint32_t k
 );
 
-int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t n);
+/**
+ * Set one multi-vector query on a List<FixedSizeList<float16|float32|float64>> column.
+ * Inner vectors must be non-nullable and contain no null elements; the outer list may be nullable.
+ * query_data contains dimension * num_vectors aligned elements in row-major order.
+ * Both sizes and k must be positive. At most 128 query subvectors are accepted;
+ * num_vectors * k and refine_factor * k must each be at most 100000.
+ * Values are copied before returning. The default metric is L2 on every fragment.
+ * Scores sum each query vector's minimum distance; refinement defaults to 1.
+ * Returns 0 on success, -1 on error. Stored invalid elements fail during execution.
+ */
+int32_t lance_scanner_nearest_multivector(
+    LanceScanner* scanner, const char* column, const void* query_data,
+    size_t dimension, size_t num_vectors, LanceDataType element_type, uint32_t k
+);
+
+/**
+ * Set both the minimum and maximum vector-index partition-search bounds.
+ *
+ * This replaces both bounds configured by earlier calls to any nprobes
+ * setter. The value must be greater than zero. Must be set before scanning.
+ */
+int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes);
+
+/**
+ * Set the minimum number of vector-index partitions to search.
+ * This replaces only the minimum bound; the current maximum is preserved.
+ * Must be greater than zero and no greater than `maximum_nprobes` when set.
+ * An invalid resulting range is rejected without changing either bound.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_minimum_nprobes(
+    LanceScanner* scanner,
+    uint32_t minimum_nprobes
+);
+
+/**
+ * Set the maximum number of vector-index partitions to search.
+ * This replaces only the maximum bound; the current minimum is preserved.
+ * Must be greater than zero and no less than `minimum_nprobes` when set.
+ * This only affects prefiltered searches that need more candidates.
+ * An invalid resulting range is rejected without changing either bound.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_maximum_nprobes(
+    LanceScanner* scanner,
+    uint32_t maximum_nprobes
+);
+
+/**
+ * Configure the speed / accuracy tradeoff for approximate vector search.
+ * Must be set before scanning starts.
+ */
+int32_t lance_scanner_set_approx_mode(
+    LanceScanner* scanner,
+    LanceApproxMode approx_mode
+);
 
 /**
  * Set vector index partition-search concurrency for each query.
@@ -1825,6 +2282,36 @@ int32_t lance_scanner_set_index_segments(
     const uint8_t* segment_uuids,
     size_t len
 );
+
+/**
+ * Accelerate an ordinary scalar-filtered scan with one physical index segment.
+ * segment_uuid points to 16 UUID bytes in RFC 4122 order; NULL clears the setting.
+ * Must be configured before scanning. Requires explicit nonempty fragment_ids,
+ * which define BOTH the read and fallback domain, independently of the segment.
+ * Missing snapshot UUIDs / fragment IDs are errors. Extra segment coverage is
+ * excluded by fragment_ids; incomplete coverage falls back to a full filtered
+ * scan of those fragment_ids. Callers distributing work must assign disjoint
+ * fragment domains and separately include any unindexed data they wish to read.
+ * The segment metadata must identify one key field present in the schema.
+ *
+ * BTree/Bitmap/LabelList searches use a necessary AND-conjunct of the
+ * full scanner filter on the selected logical index and require an Exact result.
+ * use_scalar_index=false skips segment search and uses the scoped fallback;
+ * snapshot UUID and fragment validation still applies.
+ * AtMost/AtLeast results fall back to a full filtered scan of fragment_ids.
+ * All predicates are reapplied during candidate reads; other scalar indices
+ * are disabled. Legacy storage, OR/NOT-only filters,
+ * overlays, fragment reuse, unsupported index types / result domains
+ * and missing coverage use the same domain without an index. No filter also
+ * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
+ * unfiltered candidate set. Vector/FTS queries and include_deleted_rows=true
+ * are rejected even when use_scalar_index=false; segment mode is live-row-only.
+ *
+ * UUID bytes are copied. Metadata and final option compatibility are validated
+ * when creating the stream. Index corruption or I/O failures remain errors.
+ */
+int32_t lance_scanner_set_scalar_index_segment(
+    LanceScanner* scanner, const uint8_t* segment_uuid);
 
 /* ─── Full-text search (Phase 2) ─── */
 

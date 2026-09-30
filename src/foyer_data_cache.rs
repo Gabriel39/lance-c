@@ -19,6 +19,7 @@ use foyer::{
 };
 use futures::stream::BoxStream;
 use lance_io::object_store::WrappingObjectStore;
+use object_store::list::PaginatedListStore;
 use object_store::path::Path;
 use object_store::{
     Attribute, Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
@@ -396,6 +397,15 @@ impl WrappingObjectStore for DatasetFoyerDataCache {
         self.cache.remember_wrapper(&wrapped, &original);
         wrapped
     }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn PaginatedListStore>,
+    ) -> Option<Arc<dyn PaginatedListStore>> {
+        // Data caching does not hide or rewrite paths, so keep listing pushdown.
+        Some(original)
+    }
 }
 
 #[derive(Debug)]
@@ -441,8 +451,9 @@ impl DataCacheObjectStore {
             .cache
             .size_key(&self.reader.store_prefix, location);
         let cached_metadata = self.reader.cache.metadata.get(&metadata_key);
-        let (metadata, attributes) = if let Some(entry) = cached_metadata {
-            entry.value().clone()
+        let (metadata, attributes, extensions) = if let Some(entry) = cached_metadata {
+            let (metadata, attributes) = entry.value();
+            (metadata.clone(), attributes.clone(), Default::default())
         } else {
             let result = self
                 .reader
@@ -455,12 +466,13 @@ impl DataCacheObjectStore {
                     },
                 )
                 .await?;
-            // Cache only immutable metadata and attributes, never request-specific state.
+            // HTTP responses carry transport extensions even for immutable files.
+            // Cache metadata independently; request-specific extensions are never replayed.
             self.reader.cache.metadata.insert(
                 metadata_key,
                 (result.meta.clone(), result.attributes.clone()),
             );
-            (result.meta, result.attributes)
+            (result.meta, result.attributes, result.extensions)
         };
         let object_size = metadata.size;
         self.reader.cache.cache.insert(
@@ -514,6 +526,7 @@ impl DataCacheObjectStore {
             meta: metadata,
             range,
             attributes,
+            extensions,
         })
     }
 }
@@ -940,6 +953,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            !first.extensions.is_empty(),
+            "HTTP response must exercise transport extensions"
+        );
         let meta = first.meta.clone();
         let attributes = first.attributes.clone();
         assert_eq!(first.range, 100..200);
@@ -949,6 +966,7 @@ mod tests {
 
         // Metadata must be shared with fresh dataset scopes, just like cached blocks.
         let (fresh, _) = wrap_for_test(&cache, original);
+        let mut replayed_extensions = false;
         for store in [&wrapped, &fresh] {
             let result = store
                 .get_opts(
@@ -960,6 +978,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            replayed_extensions |= !result.extensions.is_empty();
             assert_eq!(result.meta, meta);
             assert_eq!(result.attributes, attributes);
             assert_eq!(result.range, 120..180);
@@ -974,6 +993,10 @@ mod tests {
             gets.load(Ordering::SeqCst),
             1,
             "cache hits must not issue GET"
+        );
+        assert!(
+            !replayed_extensions,
+            "cached metadata must not replay response extensions"
         );
         wrapped.head(&path).await.unwrap();
         assert_eq!(
@@ -1165,7 +1188,7 @@ mod tests {
             original.put(path, data.clone().into()).await.unwrap();
         }
 
-        let (wrapped, statistics) = wrap_for_test(&cache, original);
+        let (wrapped, statistics) = wrap_for_test(&cache, original.clone());
         for (path, requested, expected_range) in cases {
             let expected = data.slice(expected_range.start as usize..expected_range.end as usize);
             let before = statistics.snapshot();
@@ -1182,14 +1205,16 @@ mod tests {
                 before.bytes_read_from_remote + expected.len() as u64
             );
 
+            // Cached data reads must not depend on an extra origin HEAD request.
+            let expected_meta = original.head(&path).await.unwrap();
+            original.delete(&path).await.unwrap();
             let second = wrapped
                 .get_opts(&path, GetOptions::new().with_range(Some(requested)))
                 .await
-                .unwrap()
-                .bytes()
-                .await
                 .unwrap();
-            assert_eq!(second, expected);
+            assert_eq!(second.meta, expected_meta);
+            assert_eq!(second.range, expected_range);
+            assert_eq!(second.bytes().await.unwrap(), expected);
             assert_eq!(
                 statistics.snapshot().bytes_read_from_cache,
                 before.bytes_read_from_cache + expected.len() as u64

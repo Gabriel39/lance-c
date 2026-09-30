@@ -70,6 +70,40 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 | [x] | Data-file cache | Optional Foyer memory/disk cache for immutable `data/*.lance` reads |
 
+## Multi-vector search
+
+Use `lance_scanner_nearest_multivector` or the C++ `Scanner::nearest_multivector`
+method for a `List<FixedSizeList<float16|float32|float64, D>>` column:
+
+```cpp
+const float query[] = {1.0f, 0.0f, 0.0f, 1.0f};
+auto scanner = dataset.scan();
+scanner.nearest_multivector("embeddings", query, 2, 2, LANCE_DTYPE_FLOAT32, 10)
+       .metric(LANCE_METRIC_COSINE)
+       .prefilter(true);
+```
+
+The copied, row-major matrix is **one query** containing two subvectors. Results
+rank logical rows by the sum of each query subvector's minimum distance to a
+stored subvector. Empty or null outer rows do not rank. Inner vectors must be
+non-nullable; actual stored null or non-finite elements encountered during
+scoring fail the stream. Float types and dimensions must match the column.
+Cosine pairs with zero norm have undefined distance and are ignored. A row is
+excluded if any query subvector has no defined match; a zero-norm query subvector
+therefore produces no results. Column names use Lance field-path syntax,
+including nested paths such as `payload.embeddings` and backtick-quoted names.
+
+L2 is the default on every fragment. Cosine multi-vector indexes are supported
+by the pinned Lance version; incompatible metrics use exact search. Indexed
+candidates are refined against stored values (`refine_factor` defaults to 1).
+ANN candidate selection remains approximate. Limit and offset apply after
+restoring distance order, including fragment-scoped searches. Strict row batching
+is applied after that final result window, preserving full batches except the last.
+
+Queries accept at most 128 subvectors. Both `num_vectors * k` and
+`refine_factor * k` must be at most 100,000 to bound plan expansion and candidate
+allocation. The existing single-vector API and its defaults are unchanged.
+
 ## Building
 
 There are four supported entry points; pick whichever matches your toolchain.
@@ -203,7 +237,9 @@ create the session with Foyer configuration. The cache is deliberately narrow:
 whole-object, single-range, and batched range reads of direct `data/*.lance`
 children are cached. Conditional and versioned reads, plus manifests, deletion
 files, and index files, keep using Lance's normal paths. Use one shared session
-for datasets that share the cache directory.
+for datasets that share the cache directory. Immutable data-file response metadata
+uses a separate in-memory cache budget of one eighth of the configured data
+memory capacity, avoiding a remote HEAD request on repeated range reads.
 
 ```cpp
 lance::DataCacheOptions data_cache{

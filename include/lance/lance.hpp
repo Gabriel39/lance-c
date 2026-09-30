@@ -235,6 +235,73 @@ public:
     const LanceFtsQueryContext* c_handle() const { return handle_.get(); }
 };
 
+// ─── Blob file ───────────────────────────────────────────────────────────────
+
+/// RAII handle over one value of a Blob v2 column, from `Dataset::take_blobs()`
+/// or `take_blobs_by_indices()`. Stays usable after the Dataset is destroyed.
+/// `read()` and `read_up_to()` advance the cursor, `read_range()` does not.
+/// Not thread-safe per handle.
+class BlobFile {
+    Handle<LanceBlobFile, lance_blob_file_close> handle_;
+
+public:
+    /// Adopt a handle from the C API; closed on destruction.
+    explicit BlobFile(LanceBlobFile* blob) : handle_(blob) {}
+
+    /// Size of the blob in bytes. Independent of the cursor.
+    uint64_t size() const {
+        uint64_t n = lance_blob_file_size(handle_.get());
+        if (lance_last_error_code() != LANCE_OK) check_error();
+        return n;
+    }
+
+    /// Read from the cursor to the end (the whole blob when the cursor is 0).
+    std::vector<uint8_t> read() {
+        uint64_t blob_size = size();
+        uint64_t cursor = tell();
+        uint64_t remaining = cursor >= blob_size ? 0 : blob_size - cursor;
+        std::vector<uint8_t> out(static_cast<size_t>(remaining));
+        if (lance_blob_file_read(handle_.get(), out.data(), out.size()) != 0)
+            check_error();
+        return out;
+    }
+
+    /// Read at most `len` bytes from the current cursor, advancing it past
+    /// them. The result is shorter than `len` at the end of the blob.
+    std::vector<uint8_t> read_up_to(size_t len) {
+        std::vector<uint8_t> out(len);
+        size_t bytes_read = 0;
+        if (lance_blob_file_read_up_to(
+                handle_.get(), out.data(), len, &bytes_read) != 0)
+            check_error();
+        out.resize(bytes_read);
+        return out;
+    }
+
+    /// Read exactly `len` bytes at `offset` without moving the cursor. The
+    /// range must lie within the blob.
+    std::vector<uint8_t> read_range(uint64_t offset, size_t len) const {
+        std::vector<uint8_t> out(len);
+        if (lance_blob_file_read_range(
+                handle_.get(), offset, out.data(), len) != 0)
+            check_error();
+        return out;
+    }
+
+    /// Move the cursor. Seeking past the end is allowed; reads then return
+    /// no bytes.
+    void seek(uint64_t pos) {
+        if (lance_blob_file_seek(handle_.get(), pos) != 0) check_error();
+    }
+
+    /// Current cursor position, in bytes from the start of the blob.
+    uint64_t tell() const {
+        uint64_t pos = 0;
+        if (lance_blob_file_tell(handle_.get(), &pos) != 0) check_error();
+        return pos;
+    }
+};
+
 // ─── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -249,6 +316,24 @@ class Dataset {
         }
         kv.push_back(nullptr);
         return kv;
+    }
+
+    /// Move raw handles into RAII owners. `blobs` must be reserved up front so
+    /// nothing can throw while handles are still unowned.
+    ///
+    /// Leak-freedom also rests on the C side: `lance_dataset_take_blobs*` fill
+    /// `out` all-or-nothing and leave it untouched on error. A partial fill
+    /// before an error would leak, because `check_error()` throws before this
+    /// runs and `raw` owns nothing.
+    static void adopt_blobs(const std::vector<LanceBlobFile*>& raw,
+                            std::vector<std::optional<BlobFile>>& blobs) {
+        for (auto* blob : raw) {
+            if (blob) {
+                blobs.emplace_back(BlobFile(blob));
+            } else {
+                blobs.emplace_back(std::nullopt);
+            }
+        }
     }
 
 public:
@@ -795,6 +880,43 @@ public:
         }
     }
 
+    /// Take blob handles by dataset row ID; element `i` is for `row_ids[i]`,
+    /// `std::nullopt` for a null blob value.
+    std::vector<std::optional<BlobFile>> take_blobs(
+        const uint64_t* row_ids, size_t num_row_ids,
+        const std::string& column) const {
+        std::vector<LanceBlobFile*> raw(num_row_ids, nullptr);
+        std::vector<std::optional<BlobFile>> blobs;
+        blobs.reserve(num_row_ids);
+        // An empty vector's data() may be null, which the C side rejects.
+        if (num_row_ids > 0 &&
+            lance_dataset_take_blobs(handle_.get(), row_ids, num_row_ids,
+                                     column.c_str(), raw.data()) != 0) {
+            check_error();
+        }
+        adopt_blobs(raw, blobs);
+        return blobs;
+    }
+
+    /// Take blob handles by 0-based row index, with the same ownership and
+    /// null-slot semantics as the overload above.
+    std::vector<std::optional<BlobFile>> take_blobs_by_indices(
+        const uint64_t* indices, size_t num_indices,
+        const std::string& column) const {
+        std::vector<LanceBlobFile*> raw(num_indices, nullptr);
+        std::vector<std::optional<BlobFile>> blobs;
+        blobs.reserve(num_indices);
+        // Same empty-request shortcut as take_blobs().
+        if (num_indices > 0 &&
+            lance_dataset_take_blobs_by_indices(
+                handle_.get(), indices, num_indices,
+                column.c_str(), raw.data()) != 0) {
+            check_error();
+        }
+        adopt_blobs(raw, blobs);
+        return blobs;
+    }
+
     /// Create a Scanner builder for this dataset.
     Scanner scan() const;
 
@@ -963,6 +1085,41 @@ public:
             check_error();
         out.resize(static_cast<size_t>(written));
         return out;
+    }
+
+    /// Commit previously built uncommitted index segments as one logical
+    /// index under `index_name` on `column`. Each entry of
+    /// `segment_metadata` is the protobuf-encoded IndexMetadata produced by
+    /// `IndexSegmentBuilder::execute_uncommitted()`. The commit is a single
+    /// dataset version bump. Every segment must have been built for `column`.
+    /// Coexisting vector segments, including retained existing segments, must
+    /// have compatible metrics, dimensions, sub-index types, and quantizer
+    /// kinds; independently trained IVF centroids and PQ codebooks may differ.
+    /// Replacement of existing same-name segments is automatic and
+    /// coverage-driven: fully covered segments are replaced, disjoint ones
+    /// are retained as deltas, and partial overlap is rejected. A commit
+    /// whose index type differs from the existing same-name index replaces
+    /// that index entirely, so it must cover every current fragment; a
+    /// partial-coverage type change is rejected.
+    /// Fully replaced vector segments do not constrain the new metric.
+    /// Throws lance::Error on validation failures (empty set, duplicate
+    /// segment UUIDs, overlapping fragment coverage, unknown or mismatched
+    /// column, incompatible vector segments), leaving the version and index
+    /// unchanged.
+    void commit_index_segments(
+        const std::string& index_name,
+        const std::string& column,
+        const std::vector<std::vector<uint8_t>>& segment_metadata) {
+        std::vector<const uint8_t*> bytes(segment_metadata.size());
+        std::vector<size_t> lens(segment_metadata.size());
+        for (size_t i = 0; i < segment_metadata.size(); ++i) {
+            bytes[i] = segment_metadata[i].data();
+            lens[i] = segment_metadata[i].size();
+        }
+        if (lance_dataset_commit_index_segments(
+                handle_.get(), index_name.c_str(), column.c_str(), bytes.data(),
+                lens.data(), segment_metadata.size()) != 0)
+            check_error();
     }
 
     /// Access the underlying C handle (does not transfer ownership).
@@ -1152,6 +1309,27 @@ public:
         return std::vector<uint8_t>(guard.bytes, guard.bytes + len);
     }
 
+    /// Register a non-null index-build progress callback. Must be called
+    /// before execute_uncommitted; the builder is single-use. The callback is
+    /// invoked from internal worker threads and may be called concurrently
+    /// from parallel worker tasks, so it must be thread-safe, non-blocking,
+    /// and must not re-enter any lance_* function. It must return normally;
+    /// unwinding or throwing across this boundary can abort the host process.
+    /// Invocations occur only while execute_uncommitted runs, and this is
+    /// enforced: lance-c disables the callback and drains in-flight
+    /// invocations before that call returns, including on error, so a worker
+    /// task detached by core can never invoke it afterwards. The callback and
+    /// the context (if non-null) must remain valid until execute_uncommitted
+    /// returns. Progress reporting is advisory and cannot affect the build
+    /// outcome.
+    IndexSegmentBuilder& progress_callback(LanceIndexBuildProgressCallback callback,
+                                           void* callback_ctx) {
+        if (lance_index_segment_builder_set_progress_callback(handle_.get(), callback,
+                                                              callback_ctx) != 0)
+            check_error();
+        return *this;
+    }
+
     LanceIndexSegmentBuilder* c_handle() { return handle_.get(); }
 };
 
@@ -1298,9 +1476,71 @@ public:
         return *this;
     }
 
+    /// Configure whether scalar indices may be used to optimize filters.
+    /// False also disables explicit scalar segment search, retaining its fragment domain.
+    Scanner& use_scalar_index(bool enable = true) {
+        if (lance_scanner_set_use_scalar_index(handle_.get(), enable) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether row-based output batches are strict.
+    Scanner& strict_batch_size(bool strict_batch_size = true) {
+        if (lance_scanner_set_strict_batch_size(handle_.get(), strict_batch_size) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether file statistics may optimize the scan.
+    Scanner& use_stats(bool use_stats = true) {
+        if (lance_scanner_set_use_stats(handle_.get(), use_stats) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Choose how blob columns are materialized (default: descriptors for blob
+    /// columns, bytes for every other binary column).
+    Scanner& blob_handling(LanceBlobHandling handling) {
+        if (lance_scanner_set_blob_handling(handle_.get(), handling) != 0)
+            check_error();
+        return *this;
+    }
+
     /// Enable/disable row ID in output.
     Scanner& with_row_id(bool enable = true) {
         if (lance_scanner_with_row_id(handle_.get(), enable) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Include or omit the `_rowaddr` metadata column.
+    Scanner& with_row_address(bool enable = true) {
+        if (lance_scanner_with_row_address(handle_.get(), enable) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Configure whether deleted rows still present in storage are returned.
+    /// Requires with_row_id(true); use_scalar_index(false) is needed for filtered scans.
+    /// Incompatible with scalar_index_segment. See lance.h.
+    Scanner& include_deleted_rows(bool include_deleted_rows = true) {
+        if (lance_scanner_set_include_deleted_rows(handle_.get(), include_deleted_rows) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Generate exact candidates from one BTree/Bitmap/LabelList segment.
+    /// fragment_ids is required and defines the complete read/fallback domain. See lance.h.
+    /// Requires live rows only: include_deleted_rows(true) is rejected at stream creation.
+    /// use_scalar_index(false) selects the scoped fallback without searching the segment.
+    Scanner& scalar_index_segment(const std::array<uint8_t, 16>& segment_uuid) {
+        if (lance_scanner_set_scalar_index_segment(handle_.get(), segment_uuid.data()) != 0)
+            check_error();
+        return *this;
+    }
+
+    Scanner& clear_scalar_index_segment() {
+        if (lance_scanner_set_scalar_index_segment(handle_.get(), nullptr) != 0)
             check_error();
         return *this;
     }
@@ -1411,8 +1651,33 @@ public:
         return *this;
     }
 
-    Scanner& nprobes(uint32_t n) {
-        if (lance_scanner_set_nprobes(handle_.get(), n) != 0) check_error();
+    /// One multi-vector query, copied from dimension * num_vectors row-major elements.
+    Scanner& nearest_multivector(const std::string& column, const void* query_data,
+                                size_t dimension, size_t num_vectors,
+                                LanceDataType element_type, uint32_t k) {
+        if (lance_scanner_nearest_multivector(handle_.get(), column.c_str(), query_data,
+                                            dimension, num_vectors, element_type, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Replace both minimum and maximum partition-search bounds.
+    Scanner& nprobes(uint32_t nprobes) {
+        if (lance_scanner_set_nprobes(handle_.get(), nprobes) != 0) check_error();
+        return *this;
+    }
+    /// Replace only the minimum partition-search bound.
+    Scanner& minimum_nprobes(uint32_t minimum_nprobes) {
+        if (lance_scanner_set_minimum_nprobes(handle_.get(), minimum_nprobes) != 0) check_error();
+        return *this;
+    }
+    /// Replace only the maximum partition-search bound.
+    Scanner& maximum_nprobes(uint32_t maximum_nprobes) {
+        if (lance_scanner_set_maximum_nprobes(handle_.get(), maximum_nprobes) != 0) check_error();
+        return *this;
+    }
+    Scanner& approx_mode(LanceApproxMode approx_mode) {
+        if (lance_scanner_set_approx_mode(handle_.get(), approx_mode) != 0) check_error();
         return *this;
     }
     Scanner& query_parallelism(int32_t parallelism) {

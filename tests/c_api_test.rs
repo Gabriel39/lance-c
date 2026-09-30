@@ -10,6 +10,7 @@ use std::ffi::{CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use arrow::ffi::from_ffi;
@@ -17,7 +18,10 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
-use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, Float32Array, Int32Array, LargeBinaryArray, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_c::*;
@@ -246,6 +250,134 @@ unsafe extern "C" fn capture_scan_statistics_atomically(
         return;
     }
     captured.calls.fetch_add(1, AtomicOrdering::SeqCst);
+}
+
+// ─── Index build progress capture fixture ───
+
+/// Records progress events plus the exact `callback_ctx` pointer each
+/// invocation received, so tests can verify the context round-trips.
+#[derive(Default)]
+struct ProgressCapture {
+    events: Vec<(i32, String, u64, String, u64)>,
+    contexts: Vec<*mut c_void>,
+}
+
+/// Heap-allocate a capture and return it as an opaque callback context.
+fn new_progress_capture() -> *mut c_void {
+    let capture: Box<Mutex<ProgressCapture>> = Box::new(Mutex::new(ProgressCapture::default()));
+    Box::into_raw(capture).cast()
+}
+
+/// Reclaim a capture created by `new_progress_capture` and return its contents.
+fn take_progress_capture(callback_ctx: *mut c_void) -> ProgressCapture {
+    assert!(!callback_ctx.is_null());
+    let capture = unsafe { Box::from_raw(callback_ctx.cast::<Mutex<ProgressCapture>>()) };
+    capture.into_inner().unwrap()
+}
+
+/// Progress callback that records every event (and the context pointer it was
+/// invoked with) into the heap `ProgressCapture` passed as `callback_ctx`.
+/// Tolerates a NULL context by ignoring the call.
+unsafe extern "C" fn record_build_progress(
+    callback_ctx: *mut c_void,
+    event: i32,
+    stage: *const c_char,
+    total: u64,
+    unit: *const c_char,
+    completed: u64,
+) {
+    if callback_ctx.is_null() {
+        return;
+    }
+    let capture = unsafe { &*callback_ctx.cast::<Mutex<ProgressCapture>>() };
+    let stage = unsafe { std::ffi::CStr::from_ptr(stage) }
+        .to_string_lossy()
+        .into_owned();
+    let unit = unsafe { std::ffi::CStr::from_ptr(unit) }
+        .to_string_lossy()
+        .into_owned();
+    let mut guard = capture.lock().unwrap();
+    guard.contexts.push(callback_ctx);
+    guard.events.push((event, stage, total, unit, completed));
+}
+
+/// Log of every raw `callback_ctx` a build invoked (as `usize` so the static
+/// stays `Sync`), for round-trip checks that pass a sentinel or NULL context
+/// instead of a capture.
+static RECORDED_PROGRESS_CONTEXTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Progress callback that records only the raw `callback_ctx` pointer, never
+/// dereferencing it. Used for sentinel / NULL context round-trip checks.
+unsafe extern "C" fn record_progress_ctx(
+    callback_ctx: *mut c_void,
+    _event: i32,
+    _stage: *const c_char,
+    _total: u64,
+    _unit: *const c_char,
+    _completed: u64,
+) {
+    RECORDED_PROGRESS_CONTEXTS
+        .lock()
+        .unwrap()
+        .push(callback_ctx as usize);
+}
+
+/// Assert the well-formedness invariants shared by every progress-capturing
+/// build: event codes are only {START, PROGRESS, COMPLETE}, stage strings are
+/// non-empty, the documented numeric mapping holds per event (PROGRESS
+/// reports total == 0, START reports completed == 0, COMPLETE zeroes both,
+/// and only START carries a unit), and per stage the first event is START,
+/// the last is COMPLETE, and START/COMPLETE counts match (one active stage at
+/// a time).
+fn assert_progress_events_well_formed(capture: &ProgressCapture) {
+    use std::collections::HashMap;
+    for (event, stage, total, unit, completed) in &capture.events {
+        assert!(
+            *event == 0 || *event == 1 || *event == 2,
+            "unexpected progress event code {event}"
+        );
+        assert!(!stage.is_empty(), "progress stage must be non-empty");
+        if *event == 1 {
+            assert_eq!(*total, 0, "PROGRESS event must report total == 0");
+        }
+        if *event == 0 {
+            assert_eq!(*completed, 0, "START event must report completed == 0");
+        }
+        if *event == 2 {
+            assert_eq!(*total, 0, "COMPLETE event must report total == 0");
+            assert_eq!(*completed, 0, "COMPLETE event must report completed == 0");
+        }
+        if *event != 0 {
+            assert!(unit.is_empty(), "non-START event must report unit == \"\"");
+        }
+    }
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_stage: HashMap<&str, Vec<i32>> = HashMap::new();
+    for (event, stage, ..) in &capture.events {
+        if !by_stage.contains_key(stage.as_str()) {
+            order.push(stage);
+        }
+        by_stage.entry(stage.as_str()).or_default().push(*event);
+    }
+    for stage in order {
+        let events = &by_stage[stage];
+        assert_eq!(
+            events.first().copied(),
+            Some(0),
+            "stage {stage} must begin with START"
+        );
+        assert_eq!(
+            events.last().copied(),
+            Some(2),
+            "stage {stage} must end with COMPLETE"
+        );
+        let starts = events.iter().filter(|&&event| event == 0).count();
+        let completes = events.iter().filter(|&&event| event == 2).count();
+        assert_eq!(
+            starts, completes,
+            "stage {stage} must pair each START with a COMPLETE"
+        );
+    }
 }
 
 /// Helper: build a tiny dataset whose `value` column is nullable AND contains
@@ -1424,6 +1556,12 @@ fn test_scanner_execution_tuning_options() {
         unsafe { lance_scanner_set_scan_in_order(scanner, false) },
         0
     );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, false) },
+        0
+    );
+    assert_eq!(unsafe { lance_scanner_set_use_stats(scanner, false) }, 0);
+    assert_eq!(unsafe { lance_scanner_with_row_address(scanner, true) }, 0);
 
     let mut ffi_stream = FFI_ArrowArrayStream::empty();
     assert_eq!(
@@ -1431,6 +1569,7 @@ fn test_scanner_execution_tuning_options() {
         0
     );
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    assert!(reader.schema().field_with_name("_rowaddr").is_ok());
     let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
     assert_eq!(total_rows, 10);
 
@@ -1499,6 +1638,78 @@ fn test_scanner_execution_tuning_options_reject_invalid_values() {
 }
 
 #[test]
+fn test_scanner_strict_batch_size_and_bytes_conflict_is_recoverable() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let consume = |scanner| {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+            0
+        );
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        assert_eq!(
+            reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+            5
+        );
+    };
+
+    // A byte limit already exists: strict=true is rejected without starting
+    // the scan or replacing the prior strict setting.
+    let bytes_first = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(bytes_first, 1024) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(bytes_first, true) },
+        -1
+    );
+    assert!(
+        take_last_error_message()
+            .contains("strict_batch_size=true cannot be combined with batch_size_bytes=1024")
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_stats(bytes_first, false) },
+        0,
+        "the rejected setter must not mark the scan as started"
+    );
+    consume(bytes_first);
+
+    // Strict sizing already exists: the byte limit is rejected without
+    // mutation. The caller can disable strict sizing and retry on this handle.
+    let strict_first = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(strict_first, true) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(strict_first, 1024) },
+        -1
+    );
+    assert!(
+        take_last_error_message()
+            .contains("strict_batch_size=true cannot be combined with batch_size_bytes=1024")
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(strict_first, false) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_batch_size_bytes(strict_first, 1024) },
+        0
+    );
+    consume(strict_first);
+
+    unsafe { lance_scanner_close(bytes_first) };
+    unsafe { lance_scanner_close(strict_first) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_scanner_execution_tuning_options_reject_after_scan_start() {
     let (_tmp, uri) = create_test_dataset();
     let c_uri = c_str(&uri);
@@ -1547,10 +1758,107 @@ fn test_scanner_execution_tuning_options_reject_after_scan_start() {
     );
     assert!(take_last_error_message().contains("scan_in_order must be set before"));
 
+    assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(scanner, false) },
+        -1
+    );
+    assert!(take_last_error_message().contains("use_scalar_index must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(scanner, true) },
+        -1
+    );
+    assert!(take_last_error_message().contains("strict_batch_size must be set before"));
+
+    assert_eq!(unsafe { lance_scanner_set_use_stats(scanner, false) }, -1);
+    assert!(take_last_error_message().contains("use_stats must be set before"));
+
+    assert_eq!(unsafe { lance_scanner_with_row_address(scanner, true) }, -1);
+    assert!(take_last_error_message().contains("with_row_address must be set before"));
+
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(scanner, true) },
+        -1
+    );
+    assert!(take_last_error_message().contains("include_deleted_rows must be set before"));
+
     let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
     assert_eq!(
         reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
         5
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_strict_batch_size_across_fragments() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_set_batch_size(scanner, 3) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(scanner, true) },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batch_sizes = reader
+        .map(|batch| batch.unwrap().num_rows())
+        .collect::<Vec<_>>();
+    assert_eq!(batch_sizes, vec![3, 3, 3, 1]);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_include_deleted_rows() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let predicate = c_str("id >= 8");
+    let mut num_deleted = 0;
+    assert_eq!(
+        unsafe { lance_dataset_delete(ds, predicate.as_ptr(), &mut num_deleted) },
+        0
+    );
+    assert_eq!(num_deleted, 2);
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(scanner, true) },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.column_by_name("_rowid").unwrap().null_count())
+            .sum::<usize>(),
+        2
     );
 
     unsafe { lance_scanner_close(scanner) };
@@ -1820,7 +2128,40 @@ fn test_null_safety_comprehensive() {
         -1
     );
     assert_eq!(
+        unsafe { lance_scanner_set_use_scalar_index(ptr::null_mut(), false) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_strict_batch_size(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_stats(ptr::null_mut(), false) },
+        -1
+    );
+    assert_eq!(
         unsafe { lance_scanner_with_row_id(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_with_row_address(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_include_deleted_rows(ptr::null_mut(), true) },
+        -1
+    );
+    assert_eq!(unsafe { lance_scanner_set_nprobes(ptr::null_mut(), 1) }, -1);
+    assert_eq!(
+        unsafe { lance_scanner_set_minimum_nprobes(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_maximum_nprobes(ptr::null_mut(), 1) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_approx_mode(ptr::null_mut(), LanceApproxMode::Normal as i32,) },
         -1
     );
 
@@ -3299,6 +3640,90 @@ fn test_create_scalar_index_btree() {
 }
 
 #[test]
+fn test_scanner_set_use_scalar_index_controls_filter_planning() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("id");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                ds,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0
+    );
+
+    let run_scan = |use_scalar_index: bool| {
+        let filter = c_str("id = 3");
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), filter.as_ptr()) };
+        assert!(!scanner.is_null());
+        assert_eq!(
+            unsafe { lance_scanner_set_use_scalar_index(scanner, use_scalar_index) },
+            0
+        );
+
+        let mut captured = CapturedScanStatistics::default();
+        assert_eq!(
+            unsafe {
+                lance_scanner_set_statistics_callback(
+                    scanner,
+                    Some(capture_scan_statistics),
+                    (&mut captured as *mut CapturedScanStatistics).cast(),
+                )
+            },
+            0
+        );
+
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+            0
+        );
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        let ids = reader
+            .flat_map(|batch| {
+                let batch = batch.unwrap();
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(captured.calls, 1);
+        unsafe { lance_scanner_close(scanner) };
+        (ids, captured)
+    };
+
+    let (indexed_ids, indexed_statistics) = run_scan(true);
+    let (unindexed_ids, unindexed_statistics) = run_scan(false);
+    assert_eq!(indexed_ids, vec![3]);
+    assert_eq!(unindexed_ids, indexed_ids);
+    assert!(
+        indexed_statistics.indices_loaded > 0,
+        "enabled scan should load the scalar index"
+    );
+    assert_eq!(
+        unindexed_statistics.indices_loaded, 0,
+        "disabled scan should bypass the scalar index"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
 fn test_scalar_index_segment_build_is_fragment_scoped_and_uncommitted() {
     let (_tmp, uri) = create_many_small_fragments(2);
     let uri_c = c_str(&uri);
@@ -4459,6 +4884,505 @@ fn test_vector_index_segment_trains_locally_for_fragment_subset() {
 }
 
 #[test]
+fn test_vector_index_segment_progress_callback() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("embedding");
+    // Mirror test_create_vector_index_ivf_pq: IVF_PQ over 256 rows, dim 16,
+    // 8 partitions, 4 sub-vectors, driven here through the segment builder.
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfPq as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 8,
+        num_sub_vectors: 4,
+        num_bits: 8,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+
+    let capture = take_progress_capture(capture_ctx);
+    // The installed context pointer round-trips to every invocation.
+    assert!(!capture.contexts.is_empty(), "expected progress events");
+    assert!(
+        capture.contexts.iter().all(|ctx| *ctx == capture_ctx),
+        "callback_ctx must round-trip unchanged"
+    );
+
+    assert_progress_events_well_formed(&capture);
+
+    let stage_names: Vec<&str> = capture
+        .events
+        .iter()
+        .map(|(_, stage, ..)| stage.as_str())
+        .collect();
+    assert!(
+        stage_names.contains(&"shuffle"),
+        "expected a shuffle stage, saw {stage_names:?}"
+    );
+    assert!(
+        stage_names.contains(&"merge_partitions"),
+        "expected a merge_partitions stage, saw {stage_names:?}"
+    );
+
+    // The shuffle stage must report at least one PROGRESS event whose
+    // completed count does not exceed the START total.
+    let shuffle_start = capture
+        .events
+        .iter()
+        .find(|(event, stage, ..)| *event == 0 && stage == "shuffle")
+        .expect("shuffle START must be present");
+    let shuffle_total = shuffle_start.2;
+    // Shuffle counts rows (rust/lance/src/index/vector/builder.rs).
+    assert_eq!(
+        shuffle_start.3, "rows",
+        "shuffle START must report unit \"rows\""
+    );
+    assert!(shuffle_total > 0, "shuffle total must be positive");
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, _, _, completed)| {
+                *event == 1 && stage == "shuffle" && *completed <= shuffle_total
+            }),
+        "expected shuffle PROGRESS with completed <= total ({shuffle_total})"
+    );
+}
+
+#[test]
+fn test_scalar_index_segment_progress_callback_sees_load_data() {
+    let (_tmp, uri) = create_vector_dataset(256, 16);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("id");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+
+    let capture = take_progress_capture(capture_ctx);
+    assert!(!capture.events.is_empty(), "expected progress events");
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, ..)| { *event == 0 && stage == "load_data" }),
+        "expected load_data START, saw {:?}",
+        capture.events
+    );
+    assert!(
+        capture
+            .events
+            .iter()
+            .any(|(event, stage, ..)| { *event == 2 && stage == "load_data" }),
+        "expected load_data COMPLETE, saw {:?}",
+        capture.events
+    );
+}
+
+#[test]
+fn test_vector_index_segment_progress_callback_multi_fragment_subset() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let selected_fragment = fragment_ids[0] as u32;
+    let column = c_str("embedding");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: &selected_fragment,
+        fragment_count: 1,
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+
+    // The fragment-scoped build still succeeds and reports progress.
+    let capture = take_progress_capture(capture_ctx);
+    assert!(!capture.events.is_empty(), "expected progress events");
+    assert_progress_events_well_formed(&capture);
+}
+
+#[test]
+fn test_index_segment_builder_progress_callback_edge_cases() {
+    // NULL builder is rejected and sets the error channel.
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                ptr::null_mut(),
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        -1
+    );
+    assert_ne!(lance_last_error_code(), lance_c::LanceErrorCode::Ok);
+    take_progress_capture(capture_ctx);
+
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    // NULL callback is rejected.
+    let column = c_str("id");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(builder, None, ptr::null_mut())
+        },
+        -1
+    );
+
+    // Setting with a NULL callback_ctx succeeds and the NULL context reaches
+    // the callback verbatim.
+    RECORDED_PROGRESS_CONTEXTS.lock().unwrap().clear();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_progress_ctx),
+                ptr::null_mut(),
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe { lance_free_bytes(bytes) };
+    assert!(
+        RECORDED_PROGRESS_CONTEXTS
+            .lock()
+            .unwrap()
+            .contains(&(ptr::null_mut::<c_void>() as usize)),
+        "NULL callback_ctx must reach the callback"
+    );
+
+    // A distinctive sentinel context round-trips to the callback.
+    let sentinel = 0xC0FFEE_usize as *mut c_void;
+    RECORDED_PROGRESS_CONTEXTS.lock().unwrap().clear();
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_progress_ctx),
+                sentinel,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe { lance_free_bytes(bytes) };
+    assert!(
+        RECORDED_PROGRESS_CONTEXTS
+            .lock()
+            .unwrap()
+            .contains(&(sentinel as usize)),
+        "sentinel callback_ctx must round-trip"
+    );
+
+    // Setting a callback after execution is rejected: the builder is single-use.
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_progress_ctx),
+                sentinel,
+            )
+        },
+        -1
+    );
+    unsafe { lance_index_segment_builder_free(builder) };
+
+    // Setting a callback twice installs only the second one.
+    let first_ctx = new_progress_capture();
+    let second_ctx = new_progress_capture();
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                first_ctx,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                second_ctx,
+            )
+        },
+        0
+    );
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert!(!bytes.is_null() && len > 0);
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+    let first = take_progress_capture(first_ctx);
+    let second = take_progress_capture(second_ctx);
+    assert!(
+        first.events.is_empty(),
+        "the replaced callback must not receive events"
+    );
+    assert!(
+        !second.events.is_empty(),
+        "the replacement callback must receive events"
+    );
+}
+
+#[test]
+fn test_index_segment_builder_progress_callback_success_clears_error() {
+    let (_tmp, uri) = create_vector_dataset(64, 8);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let column = c_str("id");
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            ptr::null(),
+            LanceScalarIndexType::BTree as i32,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+
+    // A failed set leaves a non-OK error code...
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(builder, None, ptr::null_mut())
+        },
+        -1
+    );
+    assert_ne!(lance_last_error_code(), lance_c::LanceErrorCode::Ok);
+
+    // ...and a successful set clears it back to OK.
+    let capture_ctx = new_progress_capture();
+    assert_eq!(
+        unsafe {
+            lance_index_segment_builder_set_progress_callback(
+                builder,
+                Some(record_build_progress),
+                capture_ctx,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(lance_last_error_code(), lance_c::LanceErrorCode::Ok);
+    take_progress_capture(capture_ctx);
+    unsafe {
+        lance_index_segment_builder_free(builder);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
 fn test_index_segment_options_reject_invalid_fragment_and_train_combinations() {
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 16, 8, false);
     let uri_c = c_str(&uri);
@@ -4659,6 +5583,1157 @@ fn test_index_segment_options_reject_invalid_fragment_and_train_combinations() {
     );
 
     unsafe { lance_dataset_close(dataset) };
+}
+
+/// Scalar (bitmap) segment builds reserve tens of MB from the shared
+/// datafusion spill pool; serialize them so parallel commit tests cannot
+/// exhaust the pool.
+static SCALAR_SEGMENT_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build one uncommitted scalar segment on the `id` column and return the
+/// malloc-owned protobuf metadata bytes (free with `lance_free_bytes`).
+fn build_scalar_segment_bytes(
+    dataset: *mut LanceDataset,
+    index_name: &CString,
+    index_type: LanceScalarIndexType,
+    fragment_ids: Option<&[u32]>,
+) -> (*mut u8, usize) {
+    let _build_guard = SCALAR_SEGMENT_BUILD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let column = c_str("id");
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: fragment_ids.map_or(ptr::null(), |ids| ids.as_ptr()),
+        fragment_count: fragment_ids.map_or(0, |ids| ids.len()),
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_scalar(
+            dataset,
+            column.as_ptr(),
+            index_name.as_ptr(),
+            index_type as i32,
+            ptr::null(),
+            &options,
+        )
+    };
+    assert!(!builder.is_null());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0_usize;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    unsafe { lance_index_segment_builder_free(builder) };
+    (bytes, len)
+}
+
+/// Read the UUID of an encoded segment without freeing the bytes.
+fn segment_uuid(bytes: *const u8, len: usize) -> [u8; 16] {
+    let mut metadata = ptr::null_mut();
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_parse(bytes, len, &mut metadata) },
+        0
+    );
+    let mut uuid = [0_u8; 16];
+    assert_eq!(
+        unsafe { lance_index_segment_metadata_uuid(metadata, uuid.as_mut_ptr()) },
+        0
+    );
+    unsafe { lance_index_segment_metadata_free(metadata) };
+    uuid
+}
+
+fn build_vector_segment_bytes(
+    dataset: *mut LanceDataset,
+    metric: LanceMetricType,
+    fragment_ids: &[u32],
+) -> Vec<u8> {
+    let column = c_str("embedding");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: metric as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+    let options = LanceIndexSegmentBuildOptions {
+        fragment_ids: fragment_ids.as_ptr(),
+        fragment_count: fragment_ids.len(),
+        index_uuid: ptr::null(),
+        ivf_centroids: ptr::null_mut(),
+        ivf_centroids_schema: ptr::null(),
+        pq_codebook: ptr::null_mut(),
+        pq_codebook_schema: ptr::null(),
+        mode: LanceIndexSegmentBuildMode::Auto as i32,
+    };
+    let builder = unsafe {
+        lance_index_segment_builder_new_vector(
+            dataset,
+            column.as_ptr(),
+            c_str("worker_idx").as_ptr(),
+            &params,
+            &options,
+        )
+    };
+    assert!(!builder.is_null(), "{}", take_last_error_message());
+    let mut bytes = ptr::null_mut();
+    let mut len = 0;
+    assert_eq!(
+        unsafe { lance_index_segment_builder_execute_uncommitted(builder, &mut bytes, &mut len) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let metadata = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_index_segment_builder_free(builder);
+    }
+    metadata
+}
+
+fn commit_vector_segments(dataset: *mut LanceDataset, segments: &[&[u8]]) -> i32 {
+    let bytes = segments
+        .iter()
+        .map(|segment| segment.as_ptr())
+        .collect::<Vec<_>>();
+    let lengths = segments
+        .iter()
+        .map(|segment| segment.len())
+        .collect::<Vec<_>>();
+    unsafe {
+        lance_dataset_commit_index_segments(
+            dataset,
+            c_str("embedding_idx").as_ptr(),
+            c_str("embedding").as_ptr(),
+            bytes.as_ptr(),
+            lengths.as_ptr(),
+            segments.len(),
+        )
+    }
+}
+
+fn vector_segment_query_ids(dataset: *mut LanceDataset, use_index: bool) -> Vec<i32> {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    // Offset from row 5 to avoid tied distances in the top three.
+    let query: [f32; 8] = std::array::from_fn(|component| 5.25 + component as f32 / 8.0);
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                c_str("embedding").as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                3,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_metric(scanner, LanceMetricType::L2 as i32) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_use_index(scanner, use_index) },
+        0
+    );
+    // Probe every partition so the assertion does not depend on ANN recall.
+    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let ids = reader
+        .flat_map(|batch| {
+            batch
+                .unwrap()
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    unsafe { lance_scanner_close(scanner) };
+    ids
+}
+
+fn assert_mixed_vector_metrics_rejected(retain_existing: bool) {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let l2 = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[0]);
+    let cosine = build_vector_segment_bytes(dataset, LanceMetricType::Cosine, &[1]);
+    if retain_existing {
+        assert_eq!(commit_vector_segments(dataset, &[&l2]), 0);
+    }
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let incoming: Vec<&[u8]> = if retain_existing {
+        vec![&cosine]
+    } else {
+        vec![&l2, &cosine]
+    };
+    assert_eq!(
+        commit_vector_segments(dataset, &incoming),
+        -1,
+        "incompatible vector metrics must be rejected before committing"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.to_lowercase().contains("metric"), "{message}");
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+
+    // Check both the caller's handle and a fresh reader of the persisted manifest.
+    let reopened = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!reopened.is_null());
+    for handle in [dataset, reopened] {
+        assert_eq!(unsafe { lance_dataset_version(handle) }, version_before);
+        assert_eq!(
+            unsafe { lance_dataset_index_count(handle) },
+            if retain_existing { 1 } else { 0 }
+        );
+        if retain_existing {
+            let mut uuid = [0; 16];
+            let mut count = 0;
+            assert_eq!(
+                unsafe {
+                    lance_dataset_index_segments(
+                        handle,
+                        c_str("embedding_idx").as_ptr(),
+                        uuid.as_mut_ptr(),
+                        1,
+                        &mut count,
+                    )
+                },
+                0
+            );
+            assert_eq!(count, 1);
+            assert_eq!(uuid, segment_uuid(l2.as_ptr(), l2.len()));
+            assert_eq!(
+                vector_segment_query_ids(handle, true),
+                vector_segment_query_ids(handle, false)
+            );
+        }
+    }
+    unsafe {
+        lance_dataset_close(reopened);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_mixed_vector_metrics() {
+    assert_mixed_vector_metrics_rejected(false);
+}
+
+#[test]
+fn test_commit_index_segments_rejects_metric_mismatch_with_retained_segment() {
+    assert_mixed_vector_metrics_rejected(true);
+}
+
+#[test]
+fn test_commit_index_segments_vector_delta_and_complete_metric_replacement() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    // Each worker independently trains its IVF model on different data.
+    let first = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[0]);
+    assert_eq!(commit_vector_segments(dataset, &[&first]), 0);
+    let second = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[1]);
+    assert_eq!(commit_vector_segments(dataset, &[&second]), 0);
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 2);
+    let indexed_ids = vector_segment_query_ids(dataset, true);
+    assert_eq!(indexed_ids, [5, 6, 4]);
+    assert_eq!(indexed_ids, vector_segment_query_ids(dataset, false));
+
+    // A new metric is valid when no old segment will remain in the index.
+    let replacement = build_vector_segment_bytes(dataset, LanceMetricType::Cosine, &[0, 1]);
+    assert_eq!(
+        commit_vector_segments(dataset, &[&replacement]),
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 3
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 1);
+    let mut uuid = [0; 16];
+    let mut count = 0;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                c_str("embedding_idx").as_ptr(),
+                uuid.as_mut_ptr(),
+                1,
+                &mut count,
+            )
+        },
+        0
+    );
+    assert_eq!(count, 1);
+    assert_eq!(uuid, segment_uuid(replacement.as_ptr(), replacement.len()));
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_commit_index_segments_happy_path_multi_segment_vector_index() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let column = c_str("embedding");
+    let index_name = c_str("embedding_distributed_idx");
+    let params = LanceVectorIndexSegmentParams {
+        index_type: LanceVectorIndexType::IvfFlat as i32,
+        metric: LanceMetricType::L2 as i32,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 2,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 16,
+    };
+
+    // Build one uncommitted segment per fragment (the distributed workers).
+    let mut segment_bytes = [ptr::null_mut(); 2];
+    let mut segment_lens = [0_usize; 2];
+    let mut expected_uuids = Vec::new();
+    for (worker, fragment_id) in fragment_ids.iter().enumerate() {
+        let fragment = *fragment_id as u32;
+        let options = LanceIndexSegmentBuildOptions {
+            fragment_ids: &fragment,
+            fragment_count: 1,
+            index_uuid: ptr::null(),
+            ivf_centroids: ptr::null_mut(),
+            ivf_centroids_schema: ptr::null(),
+            pq_codebook: ptr::null_mut(),
+            pq_codebook_schema: ptr::null(),
+            mode: LanceIndexSegmentBuildMode::Auto as i32,
+        };
+        let builder = unsafe {
+            lance_index_segment_builder_new_vector(
+                dataset,
+                column.as_ptr(),
+                index_name.as_ptr(),
+                &params,
+                &options,
+            )
+        };
+        assert!(!builder.is_null());
+        assert_eq!(
+            unsafe {
+                lance_index_segment_builder_execute_uncommitted(
+                    builder,
+                    &mut segment_bytes[worker],
+                    &mut segment_lens[worker],
+                )
+            },
+            0,
+            "{}",
+            unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+        );
+        unsafe { lance_index_segment_builder_free(builder) };
+        expected_uuids.push(segment_uuid(segment_bytes[worker], segment_lens[worker]));
+    }
+
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr().cast::<*const u8>(),
+                segment_lens.as_ptr(),
+                segment_lens.len(),
+            )
+        },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+
+    // One commit for the whole segment set: exactly one version bump.
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1
+    );
+    // index_count counts physical segments; both segments share one logical
+    // index name, which index_segment_count/index_segments resolve below.
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 2);
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        2
+    );
+    let mut committed_uuids = [0_u8; 32];
+    let mut committed_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                committed_uuids.as_mut_ptr(),
+                2,
+                &mut committed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(committed_count, 2);
+    for (worker, expected_uuid) in expected_uuids.iter().enumerate() {
+        assert_eq!(
+            &committed_uuids[worker * 16..(worker + 1) * 16],
+            expected_uuid
+        );
+    }
+
+    // A k-NN query resolves through the committed multi-segment index.
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    // Row 5's vector: component i is 5 + i/8, so the nearest neighbor is row 5.
+    let query: Vec<f32> = (0..8).map(|i| 5.0 + i as f32 / 8.0).collect();
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                column.as_ptr(),
+                query.as_ptr() as *const c_void,
+                8,
+                LanceDataType::Float32 as i32,
+                3,
+            )
+        },
+        0
+    );
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    let ids = reader
+        .flat_map(|batch| {
+            let batch = batch.unwrap();
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        ids[0], 5,
+        "nearest neighbor of row 5's vector must be row 5"
+    );
+
+    unsafe {
+        lance_scanner_close(scanner);
+        for bytes in segment_bytes {
+            lance_free_bytes(bytes);
+        }
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_duplicate_segment_uuids() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let fragment = 0_u32;
+    let (bytes, len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+
+    let column = c_str("id");
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    // The same encoded segment (hence the same UUID) appears twice in the set.
+    let segment_bytes = [bytes as *const u8, bytes as *const u8];
+    let segment_lens = [len, len];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                2,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_overlapping_fragment_coverage() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let fragment = 0_u32;
+    let (bytes_a, len_a) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+    let (bytes_b, len_b) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+    assert_ne!(segment_uuid(bytes_a, len_a), segment_uuid(bytes_b, len_b));
+
+    let column = c_str("id");
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    let segment_bytes = [bytes_a as *const u8, bytes_b as *const u8];
+    let segment_lens = [len_a, len_b];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                2,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes_a);
+        lance_free_bytes(bytes_b);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_malformed_metadata() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+    let fragment = 0_u32;
+    let (valid_bytes, valid_len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+
+    // Garbage that is not a protobuf message at all.
+    let garbage = [0xab_u8, 0xcd, 0xef];
+    let segment_bytes = [garbage.as_ptr()];
+    let segment_lens = [garbage.len()];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    // A valid message truncated mid-record.
+    let truncated_len = valid_len / 2;
+    let segment_bytes = [valid_bytes as *const u8];
+    let segment_lens = [truncated_len];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(valid_bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_validates_null_and_empty_inputs() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+    let empty_name = c_str("");
+    // Every case below is rejected at the FFI boundary before the metadata
+    // bytes are decoded, so a placeholder buffer is sufficient — no real
+    // segment build is needed.
+    let placeholder = [0x01_u8, 0x02, 0x03];
+    let segment_bytes = [placeholder.as_ptr()];
+    let segment_lens = [placeholder.len()];
+    let version_before = unsafe { lance_dataset_version(dataset) };
+
+    let expect_invalid = |rc: i32, case: &str| {
+        assert_eq!(rc, -1, "{case}");
+        assert_eq!(
+            lance_last_error_code(),
+            LanceErrorCode::InvalidArgument,
+            "{case}"
+        );
+    };
+
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                ptr::null_mut(),
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL dataset",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                ptr::null(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL index_name",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                empty_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "empty index_name",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                ptr::null(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL column",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                0,
+            )
+        },
+        "segment_count 0",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                ptr::null(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL segment_metadata_bytes",
+    );
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                ptr::null(),
+                1,
+            )
+        },
+        "NULL segment_metadata_lens",
+    );
+    let null_element = [ptr::null()];
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                null_element.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        "NULL segment element",
+    );
+    let zero_len = [0_usize];
+    expect_invalid(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                zero_len.as_ptr(),
+                1,
+            )
+        },
+        "zero-length segment element",
+    );
+
+    // None of the rejected calls touched the dataset.
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_commit_index_segments_rejects_unknown_column() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let missing_column = c_str("no_such_column");
+    let fragment = 0_u32;
+    let (bytes, len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[fragment]),
+    );
+
+    let segment_bytes = [bytes as *const u8];
+    let segment_lens = [len];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                missing_column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_replaces_fully_covered_segments() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let all_fragments = [fragment_ids[0] as u32, fragment_ids[1] as u32];
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+
+    // Commit one segment covering every fragment.
+    let (bytes_a, len_a) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&all_fragments),
+    );
+    let uuid_a = segment_uuid(bytes_a, len_a);
+    let segment_bytes = [bytes_a as *const u8];
+    let segment_lens = [len_a];
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    // Rebuild the same coverage under a fresh UUID and commit again: the old
+    // segment is replaced automatically (no replace flag). The uncommitted
+    // builder refuses to reuse a name that is already committed, so the
+    // rebuild happens under a scratch name; the commit registers it under
+    // `index_name` regardless of the name the segment was built with.
+    let rebuild_name = c_str("id_idx_rebuild");
+    let (bytes_b, len_b) = build_scalar_segment_bytes(
+        dataset,
+        &rebuild_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&all_fragments),
+    );
+    let uuid_b = segment_uuid(bytes_b, len_b);
+    assert_ne!(uuid_a, uuid_b);
+    let segment_bytes = [bytes_b as *const u8];
+    let segment_lens = [len_b];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        0,
+        "{}",
+        unsafe { std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy() }
+    );
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+    let mut committed_uuid = [0_u8; 16];
+    let mut committed_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                committed_uuid.as_mut_ptr(),
+                1,
+                &mut committed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(committed_count, 1);
+    assert_eq!(committed_uuid, uuid_b);
+
+    // A later commit covering only a strict subset of the live coverage
+    // would orphan the remaining fragment, so it is rejected.
+    let first_fragment = [all_fragments[0]];
+    let delta_name = c_str("id_idx_delta");
+    let (bytes_c, len_c) = build_scalar_segment_bytes(
+        dataset,
+        &delta_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&first_fragment),
+    );
+    let segment_bytes = [bytes_c as *const u8];
+    let segment_lens = [len_c];
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1,
+        "partial overlap must be rejected instead of orphaning fragments"
+    );
+
+    unsafe {
+        lance_free_bytes(bytes_a);
+        lance_free_bytes(bytes_b);
+        lance_free_bytes(bytes_c);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_rejects_wrong_column() {
+    // A segment built for one column cannot be committed under another
+    // existing column: the core rejects segments whose keyed field does not
+    // match the commit-time column's field id.
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 16, 8, false);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let index_name = c_str("id_idx");
+    let (bytes, len) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&[0]),
+    );
+
+    let wrong_column = c_str("embedding");
+    let segment_bytes = [bytes as *const u8];
+    let segment_lens = [len];
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                wrong_column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("keyed field"), "{message}");
+    assert_eq!(unsafe { lance_dataset_version(dataset) }, version_before);
+    assert_eq!(unsafe { lance_dataset_index_count(dataset) }, 0);
+
+    unsafe {
+        lance_free_bytes(bytes);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_commit_index_segments_type_change() {
+    let (_tmp, uri) = create_many_small_fragments(2);
+    let uri_c = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    let mut fragment_ids = [0_u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(dataset, fragment_ids.as_mut_ptr()) },
+        0
+    );
+    let all_fragments = [fragment_ids[0] as u32, fragment_ids[1] as u32];
+    let index_name = c_str("id_idx");
+    let column = c_str("id");
+
+    let commit = |bytes: *const u8, len: usize| -> i32 {
+        let segment_bytes = [bytes];
+        let segment_lens = [len];
+        unsafe {
+            lance_dataset_commit_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                column.as_ptr(),
+                segment_bytes.as_ptr(),
+                segment_lens.as_ptr(),
+                1,
+            )
+        }
+    };
+
+    // Commit a BTree index covering every fragment.
+    let (bytes_a, len_a) = build_scalar_segment_bytes(
+        dataset,
+        &index_name,
+        LanceScalarIndexType::BTree,
+        Some(&all_fragments),
+    );
+    let uuid_a = segment_uuid(bytes_a, len_a);
+    let version_before = unsafe { lance_dataset_version(dataset) };
+    assert_eq!(commit(bytes_a, len_a), 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 1
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    // A full-coverage commit of a different index type replaces the existing
+    // index entirely. The builder refuses to reuse a committed index name,
+    // so the Bitmap rebuild happens under a scratch name.
+    let rebuild_name = c_str("id_idx_bitmap");
+    let (bytes_b, len_b) = build_scalar_segment_bytes(
+        dataset,
+        &rebuild_name,
+        LanceScalarIndexType::Bitmap,
+        Some(&all_fragments),
+    );
+    let uuid_b = segment_uuid(bytes_b, len_b);
+    assert_ne!(uuid_a, uuid_b);
+    assert_eq!(commit(bytes_b, len_b), 0, "{}", unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message()).to_string_lossy()
+    });
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+    let mut committed_uuid = [0_u8; 16];
+    let mut committed_count = 0_u64;
+    assert_eq!(
+        unsafe {
+            lance_dataset_index_segments(
+                dataset,
+                index_name.as_ptr(),
+                committed_uuid.as_mut_ptr(),
+                1,
+                &mut committed_count,
+            )
+        },
+        0
+    );
+    assert_eq!(committed_count, 1);
+    assert_eq!(
+        committed_uuid, uuid_b,
+        "type change must replace the old segment"
+    );
+
+    // A type change with partial coverage is rejected: it would orphan the
+    // uncovered fragments of the existing index.
+    let first_fragment = [all_fragments[0]];
+    let partial_name = c_str("id_idx_partial");
+    let (bytes_c, len_c) = build_scalar_segment_bytes(
+        dataset,
+        &partial_name,
+        LanceScalarIndexType::BTree,
+        Some(&first_fragment),
+    );
+    assert_eq!(
+        commit(bytes_c, len_c),
+        -1,
+        "partial-coverage type change must be rejected"
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = unsafe {
+        std::ffi::CStr::from_ptr(lance_last_error_message())
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(message.contains("partial fragment coverage"), "{message}");
+    assert_eq!(
+        unsafe { lance_dataset_version(dataset) },
+        version_before + 2
+    );
+    assert_eq!(
+        unsafe { lance_dataset_index_segment_count(dataset, index_name.as_ptr()) },
+        1
+    );
+
+    unsafe {
+        lance_free_bytes(bytes_a);
+        lance_free_bytes(bytes_b);
+        lance_free_bytes(bytes_c);
+        lance_dataset_close(dataset);
+    }
 }
 
 #[test]
@@ -5630,6 +7705,12 @@ fn test_scanner_nearest_with_ivf_pq_index() {
             10,
         );
         lance_scanner_set_nprobes(scanner, 4);
+        assert_eq!(lance_scanner_set_minimum_nprobes(scanner, 2), 0);
+        assert_eq!(lance_scanner_set_maximum_nprobes(scanner, 6), 0);
+        assert_eq!(
+            lance_scanner_set_approx_mode(scanner, LanceApproxMode::Accurate as i32),
+            0
+        );
         assert_eq!(lance_scanner_set_query_parallelism(scanner, 4), 0);
     }
 
@@ -5644,6 +7725,242 @@ fn test_scanner_nearest_with_ivf_pq_index() {
         total += batch.unwrap().num_rows();
     }
     assert_eq!(total, 10);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_4bit_pq_prefilter_consistency() {
+    for metric in [
+        LanceMetricType::L2,
+        LanceMetricType::Cosine,
+        LanceMetricType::Dot,
+    ] {
+        // One 512-row partition exercises the bulk scoring path whose former
+        // quantized scores could select different candidates from an all-row mask.
+        let (_tmp, uri) = create_vector_dataset(512, 32);
+        let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let column = c_str("embedding");
+        let name = c_str("pq_idx");
+        let params = LanceVectorIndexParams {
+            index_type: LanceVectorIndexType::IvfPq,
+            metric,
+            num_partitions: 1,
+            num_sub_vectors: 8,
+            num_bits: 4,
+            max_iterations: 2,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 16,
+        };
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_vector_index(
+                    dataset,
+                    column.as_ptr(),
+                    name.as_ptr(),
+                    &params,
+                    false,
+                )
+            },
+            0,
+            "{}",
+            take_last_error_message()
+        );
+        let mut segment = [0_u8; 16];
+        let mut count = 0;
+        assert_eq!(
+            unsafe {
+                lance_dataset_index_segments(
+                    dataset,
+                    name.as_ptr(),
+                    segment.as_mut_ptr(),
+                    1,
+                    &mut count,
+                )
+            },
+            0
+        );
+        assert_eq!(count, 1);
+        let mut results = Vec::new();
+        for has_filter in [false, true] {
+            let filter = c_str("id >= 0");
+            let scanner = unsafe {
+                lance_scanner_new(
+                    dataset,
+                    ptr::null(),
+                    if has_filter {
+                        filter.as_ptr()
+                    } else {
+                        ptr::null()
+                    },
+                )
+            };
+            assert!(!scanner.is_null());
+            let fragment = 0_u64;
+            assert_eq!(
+                unsafe { lance_scanner_set_fragment_ids(scanner, &fragment, 1) },
+                0
+            );
+            assert_eq!(
+                unsafe { lance_scanner_set_index_segments(scanner, segment.as_ptr(), 1) },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+            let query = [0.5_f32; 32];
+            assert_eq!(
+                unsafe {
+                    lance_scanner_nearest(
+                        scanner,
+                        column.as_ptr(),
+                        query.as_ptr().cast(),
+                        query.len(),
+                        LanceDataType::Float32 as i32,
+                        10,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 1) }, 0);
+            let mut captured = CapturedScanStatistics::default();
+            assert_eq!(
+                unsafe {
+                    lance_scanner_set_statistics_callback(
+                        scanner,
+                        Some(capture_scan_statistics),
+                        (&mut captured as *mut CapturedScanStatistics).cast(),
+                    )
+                },
+                0
+            );
+            let batches = scan_all_rows_from_scanner(scanner);
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let distances = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                rows.extend(
+                    ids.values()
+                        .iter()
+                        .copied()
+                        .zip(distances.values().iter().copied()),
+                );
+            }
+            assert_eq!(rows.len(), 10);
+            assert!(rows.iter().all(|(_, distance)| distance.is_finite()));
+            // Tie order is unspecified; compare candidate IDs and their PQ scores.
+            rows.sort_by_key(|(id, _)| *id);
+            results.push(rows);
+            assert_eq!(captured.calls, 1);
+            // Quantized fast-scan and filtered scoring must both report their fused work.
+            for name in ["index_query_prepare_time", "index_distance_topk_time"] {
+                assert!(
+                    captured.metrics.iter().any(|(metric, kind, value)| {
+                        metric == name
+                            && *kind == LanceScanMetricKind::TimeNanoseconds
+                            && *value > 0
+                    }),
+                    "missing PQ timing: {name}: {:?}",
+                    captured.metrics
+                );
+            }
+
+            let loads = captured
+                .metrics
+                .iter()
+                .filter(|(name, kind, _)| {
+                    name == "prefilter_loads" && *kind == LanceScanMetricKind::Count
+                })
+                .map(|(_, _, value)| *value)
+                .sum::<u64>();
+            assert_eq!(loads, u64::from(has_filter));
+            unsafe { lance_scanner_close(scanner) };
+        }
+        assert_eq!(results[0], results[1]);
+        unsafe { lance_dataset_close(dataset) };
+    }
+}
+
+#[test]
+fn test_scanner_adaptive_nprobes_and_approx_mode_validation_and_lifecycle() {
+    let (_tmp, uri) = create_test_dataset();
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 0) }, -1);
+    assert!(take_last_error_message().contains("nprobes must be greater than 0, got 0"));
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 0) }, -1);
+    assert!(take_last_error_message().contains("minimum_nprobes must be greater than 0, got 0"));
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 0) }, -1);
+    assert!(take_last_error_message().contains("maximum_nprobes must be greater than 0, got 0"));
+    assert_eq!(unsafe { lance_scanner_set_approx_mode(scanner, 3) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got 3")
+    );
+
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 3) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("minimum_nprobes (3) must not exceed maximum_nprobes (2)")
+    );
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 1) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("minimum_nprobes (2) must not exceed maximum_nprobes (1)")
+    );
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 2) }, 0);
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, -1);
+    assert!(
+        take_last_error_message()
+            .contains("maximum_nprobes (1) must not be less than minimum_nprobes (2)")
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_approx_mode(scanner, LanceApproxMode::Fast as i32) },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+
+    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("nprobes must be set before"));
+    assert_eq!(unsafe { lance_scanner_set_minimum_nprobes(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("minimum_nprobes must be set before"));
+    assert_eq!(unsafe { lance_scanner_set_maximum_nprobes(scanner, 1) }, -1);
+    assert!(take_last_error_message().contains("maximum_nprobes must be set before"));
+    assert_eq!(
+        unsafe { lance_scanner_set_approx_mode(scanner, LanceApproxMode::Normal as i32) },
+        -1
+    );
+    assert!(take_last_error_message().contains("approx_mode must be set before"));
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        5
+    );
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
@@ -5781,6 +8098,313 @@ fn test_scanner_nearest_filter_postfilter() {
 
     unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_nearest_full_snapshot_prefilter_statistics() {
+    for stable_row_ids in [false, true] {
+        let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, stable_row_ids);
+        let uri = c_str(&uri);
+        let dataset = unsafe { lance_dataset_open(uri.as_ptr(), ptr::null(), 0) };
+        assert!(!dataset.is_null());
+        let column = c_str("embedding");
+        let params = LanceVectorIndexParams {
+            index_type: LanceVectorIndexType::IvfFlat,
+            metric: LanceMetricType::L2,
+            num_partitions: 1,
+            num_sub_vectors: 0,
+            num_bits: 0,
+            max_iterations: 2,
+            hnsw_m: 0,
+            hnsw_ef_construction: 0,
+            sample_rate: 0,
+        };
+        assert_eq!(
+            unsafe {
+                lance_dataset_create_vector_index(
+                    dataset,
+                    column.as_ptr(),
+                    ptr::null(),
+                    &params,
+                    false,
+                )
+            },
+            0
+        );
+        let mut fragments = [0_u64; 2];
+        assert_eq!(
+            unsafe { lance_dataset_fragment_ids(dataset, fragments.as_mut_ptr()) },
+            0
+        );
+
+        let mut reference_rows_scanned = None;
+        for scope in [None, Some(fragments.as_slice()), Some(&fragments[..1])] {
+            let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+            assert!(!scanner.is_null());
+            if let Some(scope) = scope {
+                assert_eq!(
+                    unsafe { lance_scanner_set_fragment_ids(scanner, scope.as_ptr(), scope.len()) },
+                    0
+                );
+            }
+            let query = [60.0_f32; 8];
+            assert_eq!(
+                unsafe {
+                    lance_scanner_nearest(
+                        scanner,
+                        column.as_ptr(),
+                        query.as_ptr().cast(),
+                        query.len(),
+                        LanceDataType::Float32 as i32,
+                        5,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+            let mut captured = CapturedScanStatistics::default();
+            assert_eq!(
+                unsafe {
+                    lance_scanner_set_statistics_callback(
+                        scanner,
+                        Some(capture_scan_statistics),
+                        (&mut captured as *mut CapturedScanStatistics).cast(),
+                    )
+                },
+                0
+            );
+            let batches = scan_all_rows_from_scanner(scanner);
+            let mut ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(captured.calls, 1);
+            let count = |name: &str| {
+                captured
+                    .metrics
+                    .iter()
+                    .filter(|(key, kind, _)| key == name && *kind == LanceScanMetricKind::Count)
+                    .map(|(_, _, value)| *value)
+                    .sum::<u64>()
+            };
+            if scope.is_some_and(|scope| scope.len() == 1) {
+                assert_eq!(ids, vec![27, 28, 29, 30, 31]);
+                assert_eq!(count("prefilter_input_rows"), 32);
+                assert_eq!(count("prefilter_row_ids"), 32);
+            } else {
+                assert_eq!(ids, vec![58, 59, 60, 61, 62]);
+                assert_eq!(count("prefilter_input_rows"), 0);
+                // Equal results alone would miss a redundant scan of every row ID.
+                let rows_scanned = count("rows_scanned");
+                if let Some(reference) = reference_rows_scanned {
+                    assert_eq!(rows_scanned, reference);
+                } else {
+                    reference_rows_scanned = Some(rows_scanned);
+                }
+            }
+            unsafe { lance_scanner_close(scanner) };
+        }
+        unsafe { lance_dataset_close(dataset) };
+    }
+}
+
+#[test]
+fn test_scanner_nearest_segment_prefilter_statistics() {
+    for stable_row_ids in [false, true] {
+        for segmented in [true, false] {
+            let (_tmp, uri) = create_multi_fragment_vector_dataset(3, 64, 8, stable_row_ids);
+            let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+            assert!(!dataset.is_null());
+            let covered = if segmented { vec![0] } else { vec![0, 1] };
+            let first = build_vector_segment_bytes(dataset, LanceMetricType::L2, &covered);
+            let uuid = segment_uuid(first.as_ptr(), first.len());
+            if segmented {
+                let second = build_vector_segment_bytes(dataset, LanceMetricType::L2, &[1]);
+                assert_eq!(commit_vector_segments(dataset, &[&first, &second]), 0);
+            } else {
+                assert_eq!(commit_vector_segments(dataset, &[&first]), 0);
+            }
+            let mut deleted = 0;
+            assert_eq!(
+                unsafe { lance_dataset_delete(dataset, c_str("id = 7").as_ptr(), &mut deleted) },
+                0
+            );
+            assert_eq!(deleted, 1);
+            for include_unindexed in [false, true] {
+                for filtered in [false, true] {
+                    let filter = c_str("id >= 32");
+                    let scanner = unsafe {
+                        lance_scanner_new(
+                            dataset,
+                            ptr::null(),
+                            if filtered {
+                                filter.as_ptr()
+                            } else {
+                                ptr::null()
+                            },
+                        )
+                    };
+                    assert!(!scanner.is_null());
+                    // Keep the ANN scope narrower than the snapshot, optionally adding a flat-search tail.
+                    let fragments = if include_unindexed {
+                        vec![0_u64, 2]
+                    } else {
+                        vec![0_u64]
+                    };
+                    assert_eq!(
+                        unsafe {
+                            lance_scanner_set_fragment_ids(
+                                scanner,
+                                fragments.as_ptr(),
+                                fragments.len(),
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(
+                        unsafe { lance_scanner_set_index_segments(scanner, uuid.as_ptr(), 1) },
+                        0
+                    );
+                    assert_eq!(unsafe { lance_scanner_set_prefilter(scanner, true) }, 0);
+                    let query = [0.0_f32; 8];
+                    assert_eq!(
+                        unsafe {
+                            lance_scanner_nearest(
+                                scanner,
+                                c_str("embedding").as_ptr(),
+                                query.as_ptr().cast(),
+                                query.len(),
+                                LanceDataType::Float32 as i32,
+                                256,
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+                    let mut captured = CapturedScanStatistics::default();
+                    assert_eq!(
+                        unsafe {
+                            lance_scanner_set_statistics_callback(
+                                scanner,
+                                Some(capture_scan_statistics),
+                                (&mut captured as *mut CapturedScanStatistics).cast(),
+                            )
+                        },
+                        0
+                    );
+                    let batches = scan_all_rows_from_scanner(scanner);
+                    let mut ids = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column_by_name("id")
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap()
+                                .values()
+                                .to_vec()
+                        })
+                        .collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    let expected = (0..64)
+                        .chain(if include_unindexed {
+                            128..192
+                        } else {
+                            128..128
+                        })
+                        .filter(|id| *id != 7 && (!filtered || *id >= 32))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        ids, expected,
+                        "stable={stable_row_ids}, segmented={segmented}, filtered={filtered}, tail={include_unindexed}"
+                    );
+                    assert_eq!(captured.calls, 1);
+                    // Zero is valid for short or uncontended stages; verify the callback
+                    // contract independently of clock resolution and scheduling.
+                    for name in [
+                        "ANNSubIndexExec_elapsed_compute",
+                        "index_open_time",
+                        "index_partition_load_time",
+                        "index_partition_prepare_time",
+                        "index_cpu_queue_wait_time",
+                        "index_search_time",
+                        "index_query_prepare_time",
+                        "index_distance_topk_time",
+                        "index_result_materialize_time",
+                    ] {
+                        assert!(
+                            captured.metrics.iter().any(|(metric, kind, _)| {
+                                metric == name && *kind == LanceScanMetricKind::TimeNanoseconds
+                            }),
+                            "missing ANN timing: {name}: {:?}",
+                            captured.metrics
+                        );
+                    }
+
+                    let loads = captured
+                        .metrics
+                        .iter()
+                        .filter(|(name, kind, _)| {
+                            name == "prefilter_loads" && *kind == LanceScanMetricKind::Count
+                        })
+                        .map(|(_, _, value)| *value)
+                        .sum::<u64>();
+                    // Correct rows alone do not detect rebuilding the complete segment allowlist.
+                    assert_eq!(
+                        loads,
+                        u64::from(filtered || !segmented),
+                        "stable={stable_row_ids}, segmented={segmented}, filtered={filtered}, tail={include_unindexed}"
+                    );
+                    if segmented && !filtered {
+                        // These counters expose the row-ID materialization cost independently
+                        // of the index search and deletion-mask work that must still execute.
+                        for name in [
+                            "prefilter_input_rows",
+                            "prefilter_row_ids",
+                            "prefilter_build_time",
+                            "prefilter_load_time",
+                        ] {
+                            let value = captured
+                                .metrics
+                                .iter()
+                                .filter(|(key, _, _)| key == name)
+                                .map(|(_, _, value)| *value)
+                                .sum::<u64>();
+                            assert_eq!(
+                                value, 0,
+                                "unexpected {name} for a complete unfiltered segment"
+                            );
+                        }
+                    } else {
+                        // An absent metric also sums to zero above. Materializing cases
+                        // must expose both timers, even when their durations are zero.
+                        for name in ["prefilter_build_time", "prefilter_load_time"] {
+                            assert!(
+                                captured.metrics.iter().any(|(metric, kind, _)| {
+                                    metric == name && *kind == LanceScanMetricKind::TimeNanoseconds
+                                }),
+                                "missing prefilter timing: {name}: {:?}",
+                                captured.metrics
+                            );
+                        }
+                    }
+                    unsafe { lance_scanner_close(scanner) };
+                }
+            }
+            unsafe { lance_dataset_close(dataset) };
+        }
+    }
 }
 
 #[test]
@@ -12360,4 +14984,2238 @@ fn test_add_columns_stream_null_dataset_consumes_stream() {
     assert_eq!(rc, -1);
     assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_stream_consumed(&stream, &drop_count);
+}
+
+#[test]
+fn test_multivector_nearest_rejects_null_handle() {
+    let column = c_str("vectors");
+    let query = [1.0f32, 0.0];
+    let status = unsafe {
+        lance_scanner_nearest_multivector(
+            ptr::null_mut(),
+            column.as_ptr(),
+            query.as_ptr().cast(),
+            2,
+            1,
+            0,
+            1,
+        )
+    };
+    assert_eq!(status, -1);
+    let error = lance_last_error_message();
+    assert!(!error.is_null());
+    let message = unsafe { std::ffi::CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { lance_free_string(error) };
+    assert!(message.contains("NULL"));
+}
+
+// Segment scans deliberately use an unprojected nullable key and a residual
+// predicate so a candidate LIMIT or loss of filter columns changes the answer.
+fn create_scalar_segment_fixture(
+    kind: lance_index::IndexType,
+    stable: bool,
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0], &[1]])
+}
+
+fn create_scalar_segment_fixture_with_options(
+    kind: lance_index::IndexType,
+    stable: bool,
+    storage_version: Option<lance_file::version::LanceFileVersion>,
+    segment_fragments: &[&[u32]],
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    let key = Arc::new(Int32Array::from(
+        (0..12)
+            .map(|id| if id % 4 == 0 { None } else { Some(id % 3) })
+            .collect::<Vec<_>>(),
+    ));
+    create_scalar_segment_fixture_from_key(kind, stable, storage_version, segment_fragments, key)
+}
+
+fn create_scalar_segment_fixture_from_key(
+    kind: lance_index::IndexType,
+    stable: bool,
+    storage_version: Option<lance_file::version::LanceFileVersion>,
+    segment_fragments: &[&[u32]],
+    key: arrow_array::ArrayRef,
+) -> (tempfile::TempDir, String, Vec<[u8; 16]>) {
+    use lance::dataset::WriteParams;
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("segments").to_str().unwrap().to_owned();
+    let uuids = lance_c::runtime::block_on(async {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("key", key.data_type().clone(), true),
+        ]));
+        let row_count = key.len();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..row_count as i32)),
+                key,
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: stable,
+                data_storage_version: storage_version,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::try_from(kind).unwrap());
+        let fragments = ds.get_fragments();
+        assert_eq!(fragments.len(), row_count.div_ceil(4));
+        let mut segments = Vec::new();
+        for fragment_ids in segment_fragments {
+            segments.push(
+                ds.create_index_builder(&["key"], kind, &params)
+                    .name("key_idx".into())
+                    .fragments(fragment_ids.to_vec())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let uuids = segments.iter().map(|s| *s.uuid.as_bytes()).collect();
+        ds.commit_existing_index_segments("key_idx", "key", segments)
+            .await
+            .unwrap();
+        uuids
+    });
+    (tmp, uri, uuids)
+}
+
+fn scalar_segment_ids(
+    uri: &str,
+    uuid: &[u8; 16],
+    fragments: &[u64],
+    filter: &str,
+    limit: Option<i64>,
+    offset: i64,
+) -> (Vec<i32>, CapturedScanStatistics) {
+    let uri = c_str(uri);
+    let filter = c_str(filter);
+    let id = c_str("id");
+    let columns = [id.as_ptr(), ptr::null()];
+    let mut captured = CapturedScanStatistics::default();
+    let mut ids = Vec::new();
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        let scanner = lance_scanner_new(ds, columns.as_ptr(), filter.as_ptr());
+        assert!(!scanner.is_null());
+        assert_eq!(
+            lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()),
+            0
+        );
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
+            0
+        );
+        if let Some(limit) = limit {
+            assert_eq!(lance_scanner_set_limit(scanner, limit), 0);
+        }
+        assert_eq!(lance_scanner_set_offset(scanner, offset), 0);
+        assert_eq!(
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast()
+            ),
+            0
+        );
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let rc = lance_scanner_to_arrow_stream(scanner, &mut stream);
+        assert_eq!(
+            rc,
+            0,
+            "{}",
+            if rc != 0 {
+                take_last_error_message()
+            } else {
+                String::new()
+            }
+        );
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, ptr::null()),
+            -1
+        );
+        {
+            let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                assert_eq!(batch.num_columns(), 1);
+                ids.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+    (ids, captured)
+}
+
+#[test]
+fn test_scalar_segment_scope_residual_limit_and_unindexed_fallback() {
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        let (_tmp, uri, uuids) = create_scalar_segment_fixture(kind, false);
+        let (ids, stats) =
+            scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(stats.calls, 1);
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1)
+        );
+        let (ids, _) =
+            scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
+        assert_eq!(
+            ids,
+            vec![3],
+            "offset and limit must apply after residual filtering"
+        );
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[1], &[1], "key >= 0 AND id >= 2", None, 0);
+        assert_eq!(ids, vec![5, 6, 7]);
+        let (ids, stats) =
+            scalar_segment_ids(&uri, &uuids[0], &[0, 2], "key >= 0 AND id >= 2", None, 0);
+        assert_eq!(
+            ids,
+            vec![2, 3, 9, 10, 11],
+            "partial coverage must not omit unindexed rows"
+        );
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, _)| name == "scalar_segment_fallback_partial_coverage")
+        );
+        let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key = 99 OR id = 0", None, 0);
+        assert_eq!(
+            ids,
+            vec![0],
+            "OR must not use just one branch as candidates"
+        );
+        assert!(
+            stats
+                .metrics
+                .iter()
+                .any(|(name, _, _)| name == "scalar_segment_fallback_no_driver")
+        );
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key = 99", None, 0);
+        assert!(ids.is_empty());
+    }
+}
+
+#[test]
+fn test_scalar_segment_metadata_residuals_fall_back_within_scope() {
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        for stable in [false, true] {
+            // One segment covers two fragments; the third fragment is unindexed.
+            // Project only id so metadata residuals must survive independently
+            // of both the stored schema and the output projection.
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0, 1]]);
+            for residual in [
+                "_rowid > 0",
+                "_rowaddr > 0",
+                "_row_created_at_version IS NOT NULL",
+                "_row_last_updated_at_version IS NOT NULL",
+            ] {
+                let filter = format!("key >= 0 AND {residual}");
+                for (fragments, expected) in [
+                    (vec![0], vec![1, 2, 3]),
+                    (vec![1], vec![5, 6, 7]),
+                    (vec![0, 1], vec![1, 2, 3, 5, 6, 7]),
+                ] {
+                    let (ids, stats) =
+                        scalar_segment_ids(&uri, &uuids[0], &fragments, &filter, None, 0);
+                    assert_eq!(ids, expected, "{kind:?}, stable={stable}, {filter}");
+                    assert_eq!(stats.calls, 1);
+                    assert_eq!(stats.indices_loaded, 0);
+                    assert_eq!(stats.index_comparisons, 0);
+                    assert!(stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segment_fallback_filter_schema" && *value == 1
+                    }));
+                    assert!(!stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segments_searched" && *value != 0
+                    }));
+                }
+            }
+            let (ids, _) = scalar_segment_ids(
+                &uri,
+                &uuids[0],
+                &[0],
+                "key >= 0 AND _rowid > 1 AND _rowaddr > 1",
+                Some(1),
+                1,
+            );
+            assert_eq!(ids, vec![3], "apply the residual before LIMIT/OFFSET");
+            for column in [
+                "_rowid",
+                "_rowaddr",
+                "_row_created_at_version",
+                "_row_last_updated_at_version",
+            ] {
+                let filter = format!("key >= 0 AND {column} IS NULL");
+                let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, None, 0);
+                assert!(ids.is_empty(), "must retain the residual: {filter}");
+            }
+            let (ids, stats) =
+                scalar_segment_ids(&uri, &uuids[0], &[0, 2], "key >= 0 AND _rowid > 0", None, 0);
+            assert_eq!(ids, vec![1, 2, 3, 9, 10, 11]);
+            assert!(stats.metrics.iter().any(|(name, _, value)| {
+                name == "scalar_segment_fallback_partial_coverage" && *value == 1
+            }));
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_label_list_exact_candidates() {
+    use arrow_array::builder::{Int32Builder, ListBuilder};
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+
+    for stable in [false, true] {
+        let mut lists = ListBuilder::new(Int32Builder::new());
+        for row in 0..16 {
+            match row {
+                0 | 9 | 13 => lists.append(false),
+                1 | 10 | 14 => lists.append(true),
+                4 => {
+                    lists.values().append_value(7);
+                    lists.append(true);
+                }
+                _ => {
+                    lists.values().append_value(42);
+                    if row == 3 || row == 11 || row == 15 {
+                        lists.values().append_value(7);
+                    }
+                    if row == 6 {
+                        lists.values().append_null();
+                    }
+                    lists.append(true);
+                }
+            }
+        }
+        // S0 covers fragments 0 and 1, S1 covers 2, and 3 is unindexed.
+        let (_tmp, uri, uuids) = create_scalar_segment_fixture_from_key(
+            IndexType::LabelList,
+            stable,
+            None,
+            &[&[0, 1], &[2]],
+            Arc::new(lists.finish()),
+        );
+        let predicate = "array_contains(key, CAST(42 AS INT))";
+        let filter = format!("{predicate} AND id >= 3");
+        for (fragments, expected) in [(vec![0, 1], vec![3, 5, 6, 7]), (vec![0], vec![3])] {
+            let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &fragments, &filter, None, 0);
+            assert_eq!(ids, expected, "stable={stable}");
+            assert_eq!(stats.calls, 1);
+            assert!(
+                stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segments_searched" && *value == 1 }),
+                "stable={stable}, metrics={:?}",
+                stats.metrics
+            );
+            assert!(
+                !stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| { name == "scalar_segment_fallbacks" && *value != 0 })
+            );
+        }
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, Some(1), 1);
+        assert_eq!(ids, vec![5], "limit/offset must follow the residual filter");
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[1], &[2], &filter, None, 0);
+        assert_eq!(ids, vec![8, 11]);
+        let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0, 3], &filter, None, 0);
+        assert_eq!(ids, vec![3, 12, 15]);
+        assert!(stats.metrics.iter().any(|(name, _, value)| {
+            name == "scalar_segment_fallback_partial_coverage" && *value == 1
+        }));
+        let (ids, stats) = scalar_segment_ids(
+            &uri,
+            &uuids[0],
+            &[0],
+            &format!("{predicate} OR id = 0"),
+            None,
+            0,
+        );
+        assert_eq!(ids, vec![0, 2, 3]);
+        assert!(stats.metrics.iter().any(|(name, _, value)| {
+            name == "scalar_segment_fallback_no_driver" && *value == 1
+        }));
+
+        for (predicate, expected) in [
+            (
+                "array_has_all(key, [CAST(42 AS INT), CAST(7 AS INT)])",
+                vec![3],
+            ),
+            (
+                "array_has_any(key, [CAST(42 AS INT), CAST(99 AS INT)])",
+                vec![2, 3, 5, 6, 7],
+            ),
+            ("array_contains(key, CAST(99 AS INT))", vec![]),
+            ("array_contains(key, CAST(NULL AS INT))", vec![]),
+            ("array_has_any(key, [])", vec![]),
+        ] {
+            let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], predicate, None, 0);
+            assert_eq!(ids, expected, "{predicate}, stable={stable}");
+        }
+        // An untyped integer literal casts this Int32 list to Int64. Such
+        // a column expression must retain the scan fallback.
+        let (ids, stats) =
+            scalar_segment_ids(&uri, &uuids[0], &[0, 1], "array_contains(key, 42)", None, 0);
+        assert_eq!(ids, vec![2, 3, 5, 6, 7]);
+        assert!(stats.metrics.iter().any(|(name, _, value)| {
+            name == "scalar_segment_fallback_no_driver" && *value == 1
+        }));
+
+        lance_c::runtime::block_on(async {
+            let mut ds = Dataset::open(&uri).await.unwrap();
+            ds.delete("id = 3").await.unwrap();
+            assert_eq!(ds.load_indices().await.unwrap().len(), 2);
+        });
+        let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], &filter, None, 0);
+        assert_eq!(ids, vec![5, 6, 7]);
+    }
+}
+
+#[test]
+fn test_scalar_segment_text_indices_still_fall_back() {
+    for kind in [lance_index::IndexType::Fm, lance_index::IndexType::NGram] {
+        for stable in [false, true] {
+            let key = Arc::new(StringArray::from(vec![
+                Some("needle"),
+                None,
+                Some(""),
+                Some("other"),
+                Some("needle"),
+                Some("other"),
+                Some(""),
+                None,
+            ]));
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_from_key(kind, stable, None, &[&[0, 1]], key);
+            for (predicate, expected) in [
+                ("contains(key, 'needle')", vec![0]),
+                ("contains(key, '')", vec![0, 2, 3]),
+            ] {
+                let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], predicate, None, 0);
+                assert_eq!(ids, expected, "{kind:?}, stable={stable}, {predicate}");
+                assert!(
+                    stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segment_fallbacks" && *value == 1
+                    })
+                );
+                if predicate == "contains(key, 'needle')" {
+                    assert!(stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segment_fallback_index_type" && *value == 1
+                    }));
+                }
+                assert!(
+                    !stats.metrics.iter().any(|(name, _, value)| {
+                        name == "scalar_segments_searched" && *value != 0
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_legacy_storage_falls_back() {
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
+    // Three fragments, with one segment covering 0 and 1. Reading only fragment
+    // 0 must retain the full predicate and must not leak rows from fragment 1.
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture_with_options(
+        lance_index::IndexType::BTree,
+        false,
+        Some(LanceFileVersion::Legacy),
+        &[&[0, 1]],
+    );
+    assert_eq!(uuids.len(), 1);
+    lance_c::runtime::block_on(async {
+        let ds = Dataset::open(&uri).await.unwrap();
+        assert_eq!(
+            ds.manifest().data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+    });
+
+    let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![2, 3]);
+    assert_eq!(stats.calls, 1);
+    assert_eq!(stats.indices_loaded, 0);
+    assert_eq!(stats.index_comparisons, 0);
+    assert!(stats.metrics.iter().any(|(name, _, value)| {
+        name == "scalar_segment_fallback_legacy_storage" && *value == 1
+    }));
+    assert!(
+        !stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value != 0)
+    );
+
+    let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", Some(1), 1);
+    assert_eq!(
+        ids,
+        vec![3],
+        "fallback must retain LIMIT/OFFSET after filtering"
+    );
+}
+
+#[test]
+fn test_scalar_segment_stable_row_ids_and_deletes() {
+    use lance::index::DatasetIndexExt;
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, true);
+    lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.delete("id = 2").await.unwrap();
+        assert_eq!(ds.load_indices().await.unwrap().len(), 2);
+    });
+    let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![3]);
+}
+
+#[test]
+fn test_scalar_segment_honors_use_scalar_index_false() {
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0], "key >= 0", None, 0);
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(
+        stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1)
+    );
+
+    let uri = c_str(&uri);
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        for disable_first in [false, true] {
+            for (fragments, filter, limit, offset, expected) in [
+                (vec![0u64], "key >= 0", None, 0, vec![1, 2, 3]),
+                (vec![0, 2], "key >= 0 AND id >= 2", Some(2), 1, vec![3, 9]),
+            ] {
+                let filter = c_str(filter);
+                let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+                assert!(!scanner.is_null());
+                assert_eq!(
+                    lance_scanner_set_fragment_ids(scanner, fragments.as_ptr(), fragments.len()),
+                    0
+                );
+                if disable_first {
+                    assert_eq!(lance_scanner_set_use_scalar_index(scanner, false), 0);
+                }
+                assert_eq!(
+                    lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()),
+                    0
+                );
+                if !disable_first {
+                    assert_eq!(lance_scanner_set_use_scalar_index(scanner, false), 0);
+                }
+                if let Some(limit) = limit {
+                    assert_eq!(lance_scanner_set_limit(scanner, limit), 0);
+                }
+                assert_eq!(lance_scanner_set_offset(scanner, offset), 0);
+                let mut captured = CapturedScanStatistics::default();
+                assert_eq!(
+                    lance_scanner_set_statistics_callback(
+                        scanner,
+                        Some(capture_scan_statistics),
+                        (&mut captured as *mut CapturedScanStatistics).cast(),
+                    ),
+                    0
+                );
+                let mut stream = FFI_ArrowArrayStream::empty();
+                assert_eq!(lance_scanner_to_arrow_stream(scanner, &mut stream), 0);
+                let mut ids = Vec::new();
+                for batch in ArrowArrayStreamReader::from_raw(&mut stream).unwrap() {
+                    let batch = batch.unwrap();
+                    ids.extend_from_slice(
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                assert_eq!(ids, expected);
+                assert_eq!(captured.calls, 1);
+                for metric in ["scalar_segments_searched", "scalar_segment_candidate_rows"] {
+                    assert_eq!(
+                        captured
+                            .metrics
+                            .iter()
+                            .filter(|(name, _, _)| name == metric)
+                            .map(|(_, _, value)| *value)
+                            .sum::<u64>(),
+                        0,
+                        "{metric}"
+                    );
+                }
+                assert_eq!(captured.indices_loaded, 0);
+                assert_eq!(captured.index_comparisons, 0);
+                assert!(captured.metrics.iter().any(|(name, _, value)| name
+                    == "scalar_segment_fallback_disabled"
+                    && *value == 1));
+                lance_scanner_close(scanner);
+            }
+        }
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scalar_segment_rejects_include_deleted_rows_after_index_rebuild() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    let (_tmp, uri, _) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let uuid = lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.delete("id = 2").await.unwrap();
+        ds.drop_index("key_idx").await.unwrap();
+        // A segment built after the delete cannot return the tombstoned row,
+        // even though its search result is Exact for the indexed live rows.
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let segment = ds
+            .create_index_builder(&["key"], lance_index::IndexType::BTree, &params)
+            .name("key_idx".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let uuid = *segment.uuid.as_bytes();
+        ds.commit_existing_index_segments("key_idx", "key", vec![segment])
+            .await
+            .unwrap();
+        uuid
+    });
+
+    let (ids, _) = scalar_segment_ids(&uri, &uuid, &[0], "key >= 0 AND id >= 2", None, 0);
+    assert_eq!(ids, vec![3], "live-row segment scans remain supported");
+
+    let uri = c_str(&uri);
+    let filter = c_str("key >= 0 AND id >= 2");
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        assert!(!ds.is_null());
+        // Check both setter orders: compatibility is validated at stream creation.
+        for segment_first in [None, Some(false), Some(true)] {
+            let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+            assert!(!scanner.is_null());
+            assert_eq!(
+                lance_scanner_set_fragment_ids(scanner, [0u64].as_ptr(), 1),
+                0
+            );
+            assert_eq!(lance_scanner_with_row_id(scanner, true), 0);
+            if segment_first.is_none() {
+                assert_eq!(lance_scanner_set_use_scalar_index(scanner, false), 0);
+            }
+            if segment_first == Some(true) {
+                assert_eq!(
+                    lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
+                    0
+                );
+            }
+            assert_eq!(lance_scanner_set_include_deleted_rows(scanner, true), 0);
+            if segment_first == Some(false) {
+                assert_eq!(
+                    lance_scanner_set_scalar_index_segment(scanner, uuid.as_ptr()),
+                    0
+                );
+            }
+            let mut stream = FFI_ArrowArrayStream::empty();
+            let rc = lance_scanner_to_arrow_stream(scanner, &mut stream);
+            if segment_first.is_some() {
+                assert_eq!(rc, -1, "segment scans must not silently omit deleted rows");
+                assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+                assert!(take_last_error_message().contains("include_deleted_rows=true"));
+            } else {
+                assert_eq!(rc, 0);
+                let reader = ArrowArrayStreamReader::from_raw(&mut stream).unwrap();
+                let mut ids = Vec::new();
+                for batch in reader {
+                    let batch = batch.unwrap();
+                    ids.extend_from_slice(
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    vec![2, 3],
+                    "ordinary scans can still read tombstoned rows"
+                );
+            }
+            lance_scanner_close(scanner);
+        }
+        lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_scalar_segment_requires_explicit_domain_and_checks_uuid() {
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture(lance_index::IndexType::BTree, false);
+    let uri = c_str(&uri);
+    let filter = c_str("key >= 0");
+    unsafe {
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(ptr::null_mut(), ptr::null()),
+            -1
+        );
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, uuids[0].as_ptr()),
+            0
+        );
+        let mut batch = ptr::null_mut();
+        assert_eq!(lance_scanner_next(scanner, &mut batch), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        lance_scanner_close(scanner);
+        let scanner = lance_scanner_new(ds, ptr::null(), filter.as_ptr());
+        assert_eq!(
+            lance_scanner_set_fragment_ids(scanner, [0u64].as_ptr(), 1),
+            0
+        );
+        assert_eq!(
+            lance_scanner_set_scalar_index_segment(scanner, [0u8; 16].as_ptr()),
+            0
+        );
+        assert_eq!(lance_scanner_next(scanner, &mut batch), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        lance_scanner_close(scanner);
+        lance_dataset_close(ds);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scanner blob handling
+// ---------------------------------------------------------------------------
+
+// Mirror of the C enum `LanceBlobHandling`; the FFI parameter is an int32.
+const BLOB_HANDLING_BLOBS_DESCRIPTIONS: i32 = 0;
+const BLOB_HANDLING_ALL_BINARY: i32 = 1;
+const BLOB_HANDLING_ALL_DESCRIPTIONS: i32 = 2;
+
+/// Sub-fields of a Blob v2 description struct, in schema order.
+const BLOB_DESCRIPTION_FIELDS: [&str; 5] = ["kind", "position", "size", "blob_id", "blob_uri"];
+
+/// Blob storage thresholds used by [`create_blob_v2_dataset`].
+const BLOB_INLINE_THRESHOLD: usize = 16;
+const BLOB_DEDICATED_THRESHOLD: usize = 256;
+
+/// Blob sizes of the five rows in each fragment: inline, packed and dedicated
+/// against the thresholds above, then an empty blob and a null.
+const BLOB_ROW_SIZES: [Option<usize>; 5] = [Some(8), Some(128), Some(1024), Some(0), None];
+
+/// First `id` of each fragment; also seeds its payloads.
+const BLOB_FRAGMENT_BASE_IDS: [u32; 2] = [0, 100];
+
+/// Blob payload: byte `i` is `(i * 7 + 3 + seed) as u8`.
+fn blob_payload(len: usize, seed: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 + 3 + seed) as u8).collect()
+}
+
+/// One fragment's batch: ids `base_id..base_id + 5`, blobs per
+/// [`BLOB_ROW_SIZES`], `raw-<id>` in the plain binary column (null where the
+/// blob is null).
+fn blob_batch(schema: &Arc<Schema>, base_id: u32) -> RecordBatch {
+    let seed = base_id as usize;
+    let mut blobs = lance::BlobArrayBuilder::new(BLOB_ROW_SIZES.len());
+    for size in BLOB_ROW_SIZES {
+        match size {
+            Some(0) => blobs.push_empty().unwrap(),
+            Some(len) => blobs.push_bytes(blob_payload(len, seed)).unwrap(),
+            None => blobs.push_null().unwrap(),
+        }
+    }
+
+    let ids: Vec<u32> = (0..BLOB_ROW_SIZES.len() as u32)
+        .map(|row| base_id + row)
+        .collect();
+    let raw: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|id| format!("raw-{id}").into_bytes())
+        .collect();
+    let raw_array = BinaryArray::from_iter(
+        raw.iter()
+            .zip(BLOB_ROW_SIZES)
+            .map(|(value, size)| size.map(|_| value.as_slice())),
+    );
+
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(ids)),
+            blobs.finish().unwrap(),
+            Arc::new(raw_array),
+        ],
+    )
+    .unwrap()
+}
+
+/// Two-fragment v2.2 dataset with a blob column, a plain binary column and an
+/// id column; one [`blob_batch`] per entry of [`BLOB_FRAGMENT_BASE_IDS`].
+///
+/// With `enable_stable_row_ids` a `_rowid` goes through the row id index
+/// instead of being the row address.
+fn create_blob_v2_dataset(enable_stable_row_ids: bool) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("blob_ds").to_str().unwrap().to_string();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        lance::blob_field_with_options(
+            "blob",
+            true,
+            lance::BlobFieldOptions {
+                inline_size_threshold: Some(BLOB_INLINE_THRESHOLD),
+                dedicated_size_threshold: std::num::NonZeroUsize::new(BLOB_DEDICATED_THRESHOLD),
+            },
+        ),
+        Field::new("raw", DataType::Binary, true),
+    ]));
+
+    lance_c::runtime::block_on(async {
+        for (fragment, base_id) in BLOB_FRAGMENT_BASE_IDS.into_iter().enumerate() {
+            let params = lance::dataset::WriteParams {
+                mode: if fragment == 0 {
+                    lance::dataset::WriteMode::Create
+                } else {
+                    lance::dataset::WriteMode::Append
+                },
+                // Blob v2 is a 2.2 storage feature.
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                enable_stable_row_ids,
+                ..Default::default()
+            };
+            Dataset::write(
+                arrow::record_batch::RecordBatchIterator::new(
+                    vec![Ok(blob_batch(&schema, base_id))],
+                    schema.clone(),
+                ),
+                &uri,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    (tmp, uri)
+}
+
+/// Run the scanner through the C Arrow stream; return its schema and batches.
+fn scan_stream(scanner: *mut LanceScanner) -> (Schema, Vec<RecordBatch>) {
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0,
+        "to_arrow_stream should succeed"
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap();
+    let schema = reader.schema().as_ref().clone();
+    let batches: Vec<RecordBatch> = reader.map(|batch| batch.unwrap()).collect();
+    (schema, batches)
+}
+
+/// Collect `(id, blob bytes)` pairs from batches whose blob column was
+/// materialized as bytes, sorted by id.
+fn collect_blob_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("id is UInt32");
+        let blobs = batch
+            .column_by_name("blob")
+            .expect("blob column")
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("blob is LargeBinary");
+        for row in 0..batch.num_rows() {
+            let value = (!blobs.is_null(row)).then(|| blobs.value(row).to_vec());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Collect `(id, raw bytes)` pairs from the plain binary column, sorted by id.
+fn collect_raw_bytes(batches: &[RecordBatch]) -> Vec<(u32, Option<Vec<u8>>)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("id is UInt32");
+        let raw = batch
+            .column_by_name("raw")
+            .expect("raw column")
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("raw is Binary");
+        for row in 0..batch.num_rows() {
+            let value = (!raw.is_null(row)).then(|| raw.value(row).to_vec());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows
+}
+
+/// Assert that the plain binary column of the fragment based at `base_id`
+/// round-tripped: `raw-<id>` bytes, and null in the last row.
+fn assert_raw_bytes_of_fragment(rows: &[(u32, Option<Vec<u8>>)], base_id: u32) {
+    let row = |id: u32| -> &Option<Vec<u8>> {
+        &rows
+            .iter()
+            .find(|(row_id, _)| *row_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from scan output"))
+            .1
+    };
+
+    for offset in 0..4 {
+        let id = base_id + offset;
+        assert_eq!(
+            row(id).as_deref(),
+            Some(format!("raw-{id}").as_bytes()),
+            "plain binary payload of row {id} must round-trip byte for byte"
+        );
+    }
+    assert_eq!(
+        row(base_id + 4),
+        &None,
+        "null plain binary value must stay null"
+    );
+}
+
+/// Assert that the five rows written for `base_id` round-tripped byte for byte.
+fn assert_blob_bytes_of_fragment(rows: &[(u32, Option<Vec<u8>>)], base_id: u32) {
+    let row = |id: u32| -> &Option<Vec<u8>> {
+        &rows
+            .iter()
+            .find(|(row_id, _)| *row_id == id)
+            .unwrap_or_else(|| panic!("row {id} missing from scan output"))
+            .1
+    };
+    let seed = base_id as usize;
+
+    assert_eq!(
+        row(base_id).as_deref(),
+        Some(blob_payload(8, seed).as_slice()),
+        "inline blob (8 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 1).as_deref(),
+        Some(blob_payload(128, seed).as_slice()),
+        "packed blob (128 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 2).as_deref(),
+        Some(blob_payload(1024, seed).as_slice()),
+        "dedicated blob (1024 bytes) must round-trip byte for byte"
+    );
+    assert_eq!(
+        row(base_id + 3).as_deref(),
+        Some([].as_slice()),
+        "empty blob must be a zero-length, non-null value"
+    );
+    assert_eq!(row(base_id + 4), &None, "null blob must stay null");
+}
+
+/// Assert that the named field is a blob description struct.
+fn assert_blob_description_field(schema: &Schema, name: &str) {
+    let field = schema.field_with_name(name).expect("field exists");
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let names: Vec<&str> = children.iter().map(|c| c.name().as_str()).collect();
+            assert_eq!(
+                names, BLOB_DESCRIPTION_FIELDS,
+                "{name} should be a blob description struct"
+            );
+        }
+        other => panic!("{name} should be a blob description struct, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_scanner_blob_handling_all_binary_materializes_bytes() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    let blob_field = schema.field_with_name("blob").expect("blob column");
+    assert_eq!(
+        *blob_field.data_type(),
+        DataType::LargeBinary,
+        "ALL_BINARY should materialize the blob column as bytes"
+    );
+
+    // Neither blob marker survives materialization (lance v11), so a C caller
+    // cannot tell a materialized blob from a plain binary column by metadata.
+    let metadata = blob_field.metadata();
+    assert!(
+        !metadata.contains_key("lance-encoding:blob"),
+        "the blob marker should not survive materialization: {metadata:?}"
+    );
+    assert!(
+        !metadata.contains_key("ARROW:extension:name"),
+        "the blob v2 extension name should not survive materialization: {metadata:?}"
+    );
+
+    let rows = collect_blob_bytes(&batches);
+    assert_eq!(rows.len(), 10, "both fragments should be scanned");
+    assert_blob_bytes_of_fragment(&rows, 0);
+    assert_blob_bytes_of_fragment(&rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_defaults_to_descriptions() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    // Without the setter, and with an explicit BLOBS_DESCRIPTIONS, the blob
+    // column is a description struct while plain binary columns stay bytes.
+    for handling in [None, Some(BLOB_HANDLING_BLOBS_DESCRIPTIONS)] {
+        let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+        assert!(!scanner.is_null());
+        if let Some(handling) = handling {
+            assert_eq!(
+                unsafe { lance_scanner_set_blob_handling(scanner, handling) },
+                0
+            );
+        }
+
+        let (schema, batches) = scan_stream(scanner);
+        assert_blob_description_field(&schema, "blob");
+        assert_eq!(
+            *schema
+                .field_with_name("raw")
+                .expect("raw column")
+                .data_type(),
+            DataType::Binary,
+            "a plain binary column stays bytes under {handling:?}"
+        );
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            10,
+            "both fragments should be scanned under {handling:?}"
+        );
+
+        let raw_rows = collect_raw_bytes(&batches);
+        assert_raw_bytes_of_fragment(&raw_rows, 0);
+        assert_raw_bytes_of_fragment(&raw_rows, 100);
+
+        unsafe { lance_scanner_close(scanner) };
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_all_descriptions() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_DESCRIPTIONS) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    assert_blob_description_field(&schema, "blob");
+    // On lance v11 ALL_DESCRIPTIONS only rewrites fields with blob metadata
+    // (`Field::unloaded_mut` is gated on `is_blob`), so `raw` keeps its bytes.
+    assert_eq!(
+        *schema
+            .field_with_name("raw")
+            .expect("raw column")
+            .data_type(),
+        DataType::Binary,
+        "a column without blob metadata is not turned into a description"
+    );
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        10,
+        "both fragments should be scanned"
+    );
+
+    let raw_rows = collect_raw_bytes(&batches);
+    assert_raw_bytes_of_fragment(&raw_rows, 0);
+    assert_raw_bytes_of_fragment(&raw_rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_rejected_after_scan_started() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let mut ffi_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut ffi_stream) },
+        0
+    );
+    // Release the stream; the scan has started either way.
+    drop(unsafe { ArrowArrayStreamReader::from_raw(&mut ffi_stream) }.unwrap());
+
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        -1,
+        "blob handling must not change once the scan has started"
+    );
+    let message = take_last_error_message();
+    assert!(
+        message.contains("blob_handling must be set before the scan starts"),
+        "unexpected error: {message}"
+    );
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_rejects_invalid_values() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    for invalid in [3, -1] {
+        assert_eq!(
+            unsafe { lance_scanner_set_blob_handling(scanner, invalid) },
+            -1,
+            "blob_handling {invalid} should be rejected"
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        let message = take_last_error_message();
+        assert!(
+            message.contains(&format!("got {invalid}")),
+            "error for {invalid} should name the rejected value: {message}"
+        );
+    }
+
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(ptr::null_mut(), BLOB_HANDLING_ALL_BINARY) },
+        -1,
+        "NULL scanner should be rejected"
+    );
+
+    // A rejected value leaves the default handling in place.
+    let (schema, _batches) = scan_stream(scanner);
+    assert_blob_description_field(&schema, "blob");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_blob_handling_all_binary_with_fragment_ids() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let mut fragment_ids = vec![0u64; 2];
+    assert_eq!(
+        unsafe { lance_dataset_fragment_ids(ds, fragment_ids.as_mut_ptr()) },
+        0
+    );
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(
+        unsafe { lance_scanner_set_fragment_ids(scanner, fragment_ids[1..].as_ptr(), 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_set_blob_handling(scanner, BLOB_HANDLING_ALL_BINARY) },
+        0
+    );
+
+    let (schema, batches) = scan_stream(scanner);
+    assert_eq!(
+        *schema
+            .field_with_name("blob")
+            .expect("blob column")
+            .data_type(),
+        DataType::LargeBinary
+    );
+
+    let rows = collect_blob_bytes(&batches);
+    assert_eq!(
+        rows.len(),
+        5,
+        "only the selected fragment should be scanned"
+    );
+    assert!(
+        rows.iter().all(|(id, _)| (100..105).contains(id)),
+        "unexpected rows from the unselected fragment: {:?}",
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+    assert_blob_bytes_of_fragment(&rows, 100);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+// ---------------------------------------------------------------------------
+// Blob v2 random access
+// ---------------------------------------------------------------------------
+
+/// Row offset (in `id` order) of the packed blob used by the cursor tests.
+const PACKED_BLOB_ROW: usize = 1;
+/// Row offset (in `id` order) of the dedicated blob used by the cursor tests.
+const DEDICATED_BLOB_ROW: usize = 2;
+
+/// Expected bytes at row offset `row` (in `id` order); `None` for the null row.
+fn expected_blob(row: usize) -> Option<Vec<u8>> {
+    let fragment = row / BLOB_ROW_SIZES.len();
+    let seed = BLOB_FRAGMENT_BASE_IDS[fragment] as usize;
+    BLOB_ROW_SIZES[row % BLOB_ROW_SIZES.len()].map(|len| blob_payload(len, seed))
+}
+
+/// Row ids of every row in `id` order, read through the scanner.
+fn scan_blob_row_ids(dataset: *const LanceDataset) -> Vec<u64> {
+    let id_column = c_str("id");
+    let columns: [*const c_char; 2] = [id_column.as_ptr(), ptr::null()];
+    let scanner = unsafe { lance_scanner_new(dataset, columns.as_ptr(), ptr::null()) };
+    assert!(!scanner.is_null());
+    assert_eq!(unsafe { lance_scanner_with_row_id(scanner, true) }, 0);
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+
+    let mut rows: Vec<(u32, u64)> = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), row_ids.value(row)));
+        }
+    }
+    unsafe { lance_scanner_close(scanner) };
+
+    rows.sort_by_key(|(id, _)| *id);
+    rows.into_iter().map(|(_, row_id)| row_id).collect()
+}
+
+/// Take every blob of the dataset by row ID, asserting the call succeeds.
+fn take_all_blobs(dataset: *const LanceDataset) -> Vec<*mut LanceBlobFile> {
+    let row_ids = scan_blob_row_ids(dataset);
+    assert_eq!(
+        row_ids.len(),
+        2 * BLOB_ROW_SIZES.len(),
+        "two fragments of five rows"
+    );
+
+    let column = c_str("blob");
+    let mut handles = vec![ptr::null_mut::<LanceBlobFile>(); row_ids.len()];
+    let rc = unsafe {
+        lance_dataset_take_blobs(
+            dataset,
+            row_ids.as_ptr(),
+            row_ids.len(),
+            column.as_ptr(),
+            handles.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, 0, "take_blobs failed: {}", take_last_error_message());
+    handles
+}
+
+/// Read a handle from its current cursor to the end, asserting success.
+fn read_blob_to_end(handle: *mut LanceBlobFile) -> Vec<u8> {
+    let size = unsafe { lance_blob_file_size(handle) };
+    let mut cursor = 0u64;
+    assert_eq!(unsafe { lance_blob_file_tell(handle, &mut cursor) }, 0);
+    let mut buffer = vec![0u8; size.saturating_sub(cursor) as usize];
+    assert_eq!(
+        unsafe { lance_blob_file_read(handle, buffer.as_mut_ptr(), buffer.len()) },
+        0,
+        "read failed: {}",
+        take_last_error_message()
+    );
+    buffer
+}
+
+/// Close every handle; NULL slots are accepted.
+fn close_blob_handles(handles: &[*mut LanceBlobFile]) {
+    for handle in handles {
+        unsafe { lance_blob_file_close(*handle) };
+    }
+}
+
+#[test]
+fn test_blob_take_by_row_ids_covers_every_storage_layout() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+
+    // Input order, both fragments: inline, packed, dedicated, empty, null.
+    for (row, handle) in handles.iter().copied().enumerate() {
+        match expected_blob(row) {
+            None => assert!(
+                handle.is_null(),
+                "row {row}: a null blob must yield a NULL slot"
+            ),
+            Some(expected) => {
+                assert!(
+                    !handle.is_null(),
+                    "row {row}: a non-null blob must yield a handle"
+                );
+                assert_eq!(
+                    unsafe { lance_blob_file_size(handle) },
+                    expected.len() as u64,
+                    "row {row}: size must match the written payload"
+                );
+                assert_eq!(read_blob_to_end(handle), expected, "row {row}: bytes");
+            }
+        }
+    }
+
+    // An empty blob is a real handle of size 0, not a NULL slot.
+    let empty = handles[3];
+    assert!(!empty.is_null());
+    assert_eq!(unsafe { lance_blob_file_size(empty) }, 0);
+    let mut untouched = [0xABu8; 4];
+    assert_eq!(
+        unsafe { lance_blob_file_read(empty, untouched.as_mut_ptr(), untouched.len()) },
+        0,
+        "reading an empty blob failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(untouched, [0xABu8; 4], "an empty blob must write no bytes");
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_by_indices_matches_take_by_row_ids() {
+    assert_blob_take_by_indices_matches_row_ids(false);
+}
+
+#[test]
+fn test_blob_take_by_indices_matches_take_by_row_ids_with_stable_row_ids() {
+    // With stable row ids a `_rowid` is not the row address.
+    assert_blob_take_by_indices_matches_row_ids(true);
+}
+
+fn assert_blob_take_by_indices_matches_row_ids(enable_stable_row_ids: bool) {
+    let (_tmp, uri) = create_blob_v2_dataset(enable_stable_row_ids);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let by_row_id = take_all_blobs(ds);
+
+    let indices = (0..2 * BLOB_ROW_SIZES.len() as u64).collect::<Vec<_>>();
+    let column = c_str("blob");
+    let mut by_index = vec![ptr::null_mut::<LanceBlobFile>(); indices.len()];
+    let rc = unsafe {
+        lance_dataset_take_blobs_by_indices(
+            ds,
+            indices.as_ptr(),
+            indices.len(),
+            column.as_ptr(),
+            by_index.as_mut_ptr(),
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "take_blobs_by_indices failed: {}",
+        take_last_error_message()
+    );
+
+    for row in 0..indices.len() {
+        match (by_row_id[row].is_null(), by_index[row].is_null()) {
+            (true, true) => continue,
+            (false, false) => assert_eq!(
+                read_blob_to_end(by_index[row]),
+                read_blob_to_end(by_row_id[row]),
+                "row {row}: both addressing schemes must return the same bytes"
+            ),
+            (row_id_null, index_null) => panic!(
+                "row {row}: NULL slots disagree (by row id: {row_id_null}, by index: {index_null})"
+            ),
+        }
+    }
+
+    close_blob_handles(&by_row_id);
+    close_blob_handles(&by_index);
+    unsafe { lance_dataset_close(ds) };
+}
+
+/// Rows requested out of storage order: two fragments, a repeated row, and a
+/// null blob in the middle.
+const PERMUTED_ROWS: [usize; 5] = [7, 2, 2, 9, 0];
+
+#[test]
+fn test_blob_take_preserves_permuted_and_duplicated_input_order() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let all_row_ids = scan_blob_row_ids(ds);
+    let row_ids = PERMUTED_ROWS
+        .iter()
+        .map(|row| all_row_ids[*row])
+        .collect::<Vec<_>>();
+    let indices = PERMUTED_ROWS
+        .iter()
+        .map(|row| *row as u64)
+        .collect::<Vec<_>>();
+    let column = c_str("blob");
+
+    for (entry_point, ids) in [("row ids", &row_ids), ("indices", &indices)] {
+        let mut handles = vec![ptr::null_mut::<LanceBlobFile>(); ids.len()];
+        let rc = if entry_point == "row ids" {
+            unsafe {
+                lance_dataset_take_blobs(
+                    ds,
+                    ids.as_ptr(),
+                    ids.len(),
+                    column.as_ptr(),
+                    handles.as_mut_ptr(),
+                )
+            }
+        } else {
+            unsafe {
+                lance_dataset_take_blobs_by_indices(
+                    ds,
+                    ids.as_ptr(),
+                    ids.len(),
+                    column.as_ptr(),
+                    handles.as_mut_ptr(),
+                )
+            }
+        };
+        assert_eq!(
+            rc,
+            0,
+            "{entry_point}: take failed: {}",
+            take_last_error_message()
+        );
+
+        for (slot, row) in PERMUTED_ROWS.iter().copied().enumerate() {
+            let handle = handles[slot];
+            match expected_blob(row) {
+                None => assert!(
+                    handle.is_null(),
+                    "{entry_point}: slot {slot} (row {row}) must be NULL"
+                ),
+                Some(expected) => {
+                    assert!(
+                        !handle.is_null(),
+                        "{entry_point}: slot {slot} (row {row}) must hold a handle"
+                    );
+                    assert_eq!(
+                        unsafe { lance_blob_file_size(handle) },
+                        expected.len() as u64,
+                        "{entry_point}: slot {slot} (row {row}) size"
+                    );
+                    assert_eq!(
+                        read_blob_to_end(handle),
+                        expected,
+                        "{entry_point}: slot {slot} (row {row}) bytes"
+                    );
+                }
+            }
+        }
+
+        // Duplicate rows get independent handles with their own cursors.
+        assert_eq!(unsafe { lance_blob_file_seek(handles[1], 0) }, 0);
+        let mut first = u64::MAX;
+        let mut second = u64::MAX;
+        assert_eq!(unsafe { lance_blob_file_tell(handles[1], &mut first) }, 0);
+        assert_eq!(unsafe { lance_blob_file_tell(handles[2], &mut second) }, 0);
+        assert_eq!(first, 0, "{entry_point}: the rewound duplicate");
+        assert_eq!(
+            second,
+            unsafe { lance_blob_file_size(handles[2]) },
+            "{entry_point}: duplicates must not share a cursor"
+        );
+
+        close_blob_handles(&handles);
+    }
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_fixture_uses_all_three_storage_layouts() {
+    // The fixture must really produce three storage kinds; only the Rust API
+    // exposes the kind.
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let kinds = lance_c::runtime::block_on(async {
+        let dataset = Arc::new(Dataset::open(&uri).await.unwrap());
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await
+            .unwrap();
+        blobs
+            .into_iter()
+            .map(|blob| blob.unwrap().kind())
+            .collect::<Vec<_>>()
+    });
+
+    use lance_core::datatypes::BlobKind;
+    assert_eq!(
+        kinds,
+        vec![BlobKind::Inline, BlobKind::Packed, BlobKind::Dedicated],
+        "the 8, 128 and 1024 byte rows must land in three different layouts"
+    );
+}
+
+#[test]
+fn test_blob_cursor_advances_only_on_sequential_reads() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let payload = expected_blob(PACKED_BLOB_ROW).unwrap();
+    let size = unsafe { lance_blob_file_size(blob) };
+    assert_eq!(size, payload.len() as u64);
+
+    let mut cursor = u64::MAX;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 0, "a fresh handle starts at the beginning");
+
+    // A short read moves the cursor by exactly what it read.
+    let mut buffer = vec![0u8; 32];
+    let mut bytes_read = usize::MAX;
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_up_to(blob, buffer.as_mut_ptr(), buffer.len(), &mut bytes_read)
+        },
+        0,
+        "read_up_to failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(bytes_read, 32);
+    assert_eq!(buffer, payload[..32]);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 32);
+
+    // Asking for more than remains reads only what is left.
+    let mut rest = vec![0u8; payload.len()];
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, rest.as_mut_ptr(), rest.len(), &mut bytes_read) },
+        0,
+        "read_up_to failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(bytes_read, payload.len() - 32);
+    assert_eq!(&rest[..bytes_read], &payload[32..]);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, size);
+
+    // At the end, read_up_to reports zero bytes instead of failing.
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, rest.as_mut_ptr(), rest.len(), &mut bytes_read) },
+        0
+    );
+    assert_eq!(bytes_read, 0);
+
+    // seek positions the cursor, and read then starts there.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 64) }, 0);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 64);
+    let mut tail = vec![0u8; (size - 64) as usize];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, tail.as_mut_ptr(), tail.len()) },
+        0,
+        "read failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(tail, payload[64..]);
+
+    // Seeking past the end is allowed; the read that follows writes nothing.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, size + 16) }, 0);
+    let mut untouched = [0xCDu8; 8];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, untouched.as_mut_ptr(), untouched.len()) },
+        0,
+        "reading past the end failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(untouched, [0xCDu8; 8]);
+
+    // read_range is positional and leaves the cursor wherever it was.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 5) }, 0);
+    let mut window = vec![0u8; 16];
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 40, window.as_mut_ptr(), window.len()) },
+        0,
+        "read_range failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(window, payload[40..56]);
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut cursor) }, 0);
+    assert_eq!(cursor, 5, "read_range must not move the cursor");
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_read_rejects_buffer_smaller_than_remaining() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let payload = expected_blob(PACKED_BLOB_ROW).unwrap();
+
+    // One byte short of the whole blob.
+    let mut buffer = vec![0xEEu8; payload.len() - 1];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst_len 127"), "{message}");
+    assert!(message.contains("128 bytes remaining"), "{message}");
+    assert!(message.contains("cursor 0"), "{message}");
+    assert!(message.contains("blob size 128"), "{message}");
+    assert!(
+        buffer.iter().all(|byte| *byte == 0xEE),
+        "a rejected read must not touch the buffer"
+    );
+
+    // The same rejection from a non-zero cursor reports the bytes remaining,
+    // not the blob size.
+    assert_eq!(unsafe { lance_blob_file_seek(blob, 100) }, 0);
+    let mut short = vec![0u8; 27];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, short.as_mut_ptr(), short.len()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst_len 27"), "{message}");
+    assert!(message.contains("28 bytes remaining"), "{message}");
+    assert!(message.contains("cursor 100"), "{message}");
+    assert!(message.contains("blob size 128"), "{message}");
+
+    // An exactly sized buffer succeeds.
+    let mut exact = vec![0u8; 28];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, exact.as_mut_ptr(), exact.len()) },
+        0,
+        "read failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(exact, payload[100..]);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_read_range_rejects_out_of_bounds() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let size = unsafe { lance_blob_file_size(blob) };
+
+    // Four bytes past the end.
+    let mut buffer = vec![0x5Au8; 8];
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, size - 4, buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("132"), "{message}");
+    assert!(message.contains("exceeds blob size 128"), "{message}");
+    assert!(
+        buffer.iter().all(|byte| *byte == 0x5A),
+        "a rejected read_range must not touch the buffer"
+    );
+
+    // An offset plus length that overflows 64 bits is rejected before any read.
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, u64::MAX, buffer.as_mut_ptr(), 2) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains(&u64::MAX.to_string()), "{message}");
+    assert!(message.contains("len 2"), "{message}");
+
+    // An empty range succeeds and accepts a NULL destination.
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 0, ptr::null_mut(), 0) },
+        0,
+        "empty read_range failed: {}",
+        take_last_error_message()
+    );
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_handles_outlive_the_dataset() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+
+    // Handles own their readers; the dataset can go first.
+    unsafe { lance_dataset_close(ds) };
+
+    for (row, handle) in handles.iter().copied().enumerate() {
+        let Some(expected) = expected_blob(row) else {
+            continue;
+        };
+        assert_eq!(
+            unsafe { lance_blob_file_size(handle) },
+            expected.len() as u64,
+            "row {row}: size after the dataset was closed"
+        );
+        assert_eq!(
+            read_blob_to_end(handle),
+            expected,
+            "row {row}: read after the dataset was closed"
+        );
+
+        if expected.is_empty() {
+            continue;
+        }
+        let mut window = vec![0u8; expected.len().min(16)];
+        assert_eq!(
+            unsafe { lance_blob_file_read_range(handle, 0, window.as_mut_ptr(), window.len()) },
+            0,
+            "row {row}: read_range after the dataset was closed: {}",
+            take_last_error_message()
+        );
+        assert_eq!(window, expected[..window.len()], "row {row}: range bytes");
+    }
+
+    close_blob_handles(&handles);
+}
+
+#[test]
+fn test_blob_take_rejects_invalid_arguments() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let row_ids = scan_blob_row_ids(ds);
+    let blob_column = c_str("blob");
+
+    // Sentinel that no rejected call may overwrite; never dereferenced.
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = vec![sentinel; row_ids.len()];
+    let assert_out_untouched = |out: &[*mut LanceBlobFile], case: &str| {
+        for (slot, handle) in out.iter().enumerate() {
+            assert_eq!(*handle, sentinel, "{case}: slot {slot} was written");
+        }
+    };
+
+    let missing = c_str("does_not_exist");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                missing.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    // Read the code first; taking the message clears the error.
+    assert_eq!(
+        lance_last_error_code(),
+        LanceErrorCode::InvalidArgument,
+        "a misspelled column is a caller error, not an internal one"
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("does_not_exist"), "{message}");
+    assert_out_untouched(&out, "missing column");
+
+    let not_a_blob = c_str("raw");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                not_a_blob.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("raw"), "{message}");
+    assert!(message.contains("not a blob column"), "{message}");
+    assert_out_untouched(&out, "non-blob column");
+
+    // Zero identifiers is a no-op success that writes nothing.
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(ds, ptr::null(), 0, blob_column.as_ptr(), out.as_mut_ptr())
+        },
+        0,
+        "empty take failed: {}",
+        take_last_error_message()
+    );
+    assert_out_untouched(&out, "zero row ids");
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_indices(
+                ds,
+                ptr::null(),
+                0,
+                blob_column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        0,
+        "empty take by index failed: {}",
+        take_last_error_message()
+    );
+    assert_out_untouched(&out, "zero indices");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(ds, ptr::null(), 1, blob_column.as_ptr(), out.as_mut_ptr())
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("row_ids must not be NULL"), "{message}");
+    assert!(message.contains("num_row_ids = 1"), "{message}");
+    assert_out_untouched(&out, "NULL row_ids");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_indices(
+                ds,
+                ptr::null(),
+                1,
+                blob_column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("indices must not be NULL"), "{message}");
+    assert!(message.contains("num_indices = 1"), "{message}");
+    assert_out_untouched(&out, "NULL indices");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ptr::null(),
+                row_ids.as_ptr(),
+                row_ids.len(),
+                blob_column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dataset must not be NULL"), "{message}");
+    assert_out_untouched(&out, "NULL dataset");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                ptr::null(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("column must not be NULL"), "{message}");
+    assert_out_untouched(&out, "NULL column");
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                blob_column.as_ptr(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("out must not be NULL"), "{message}");
+
+    // Invalid UTF-8 in the column name.
+    let invalid_utf8 = CString::new(b"bl\xFFob".to_vec()).unwrap();
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(
+                ds,
+                row_ids.as_ptr(),
+                row_ids.len(),
+                invalid_utf8.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_out_untouched(&out, "invalid UTF-8 column");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_reads_reject_null_destination_and_out_params() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let size = unsafe { lance_blob_file_size(blob) };
+
+    // A NULL destination is only legal for a request that reads no bytes.
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, ptr::null_mut(), size as usize) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst must not be NULL"), "{message}");
+
+    let mut bytes_read = usize::MAX;
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, ptr::null_mut(), 8, &mut bytes_read) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst must not be NULL"), "{message}");
+    assert_eq!(
+        bytes_read,
+        usize::MAX,
+        "a rejected read must not report a length"
+    );
+
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(blob, 0, ptr::null_mut(), 8) },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("dst must not be NULL"), "{message}");
+
+    let mut pos = u64::MAX;
+    assert_eq!(unsafe { lance_blob_file_tell(blob, ptr::null_mut()) }, -1);
+    let message = take_last_error_message();
+    assert!(message.contains("pos must not be NULL"), "{message}");
+
+    // None of the rejections moved the cursor.
+    assert_eq!(unsafe { lance_blob_file_tell(blob, &mut pos) }, 0);
+    assert_eq!(pos, 0);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_rejects_unknown_row_id() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("blob");
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = [sentinel];
+    let unknown = [u64::MAX - 1];
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs(ds, unknown.as_ptr(), 1, column.as_ptr(), out.as_mut_ptr())
+        },
+        -1
+    );
+    // The row id decodes to a fragment that does not exist; upstream rejects
+    // the whole call.
+    let message = take_last_error_message();
+    assert!(message.contains("18446744073709551614"), "{message}");
+    assert!(message.contains("non-existent fragment"), "{message}");
+    assert_eq!(out[0], sentinel, "a rejected take must not write `out`");
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_take_by_indices_rejects_out_of_range_index() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let column = c_str("blob");
+    let sentinel = ptr::without_provenance_mut::<LanceBlobFile>(0xDEAD_BEEF);
+    let mut out = [sentinel, sentinel];
+    // A valid offset next to one just past the end of the dataset.
+    let indices = [0u64, 2 * BLOB_ROW_SIZES.len() as u64];
+
+    assert_eq!(
+        unsafe {
+            lance_dataset_take_blobs_by_indices(
+                ds,
+                indices.as_ptr(),
+                indices.len(),
+                column.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    // An offset past the end becomes a tombstone address, which upstream
+    // rejects; the valid slot is not written either.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("non-existent fragment"), "{message}");
+    assert_eq!(
+        out,
+        [sentinel, sentinel],
+        "a rejected take must not write `out`"
+    );
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_read_up_to_requires_bytes_read_out_param() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[DEDICATED_BLOB_ROW];
+    let mut buffer = [0u8; 8];
+
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_up_to(blob, buffer.as_mut_ptr(), buffer.len(), ptr::null_mut())
+        },
+        -1
+    );
+    let message = take_last_error_message();
+    assert!(message.contains("bytes_read must not be NULL"), "{message}");
+
+    // A zero-length request accepts a NULL destination and reports 0 bytes.
+    let mut bytes_read = usize::MAX;
+    assert_eq!(
+        unsafe { lance_blob_file_read_up_to(blob, ptr::null_mut(), 0, &mut bytes_read) },
+        0,
+        "zero-length read_up_to failed: {}",
+        take_last_error_message()
+    );
+    assert_eq!(bytes_read, 0);
+
+    close_blob_handles(&handles);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_blob_null_handle_is_rejected_without_crashing() {
+    /// Assert that the pending error names the NULL handle.
+    fn assert_null_handle_reported() {
+        let message = take_last_error_message();
+        assert!(message.contains("blob must not be NULL"), "{message}");
+    }
+
+    assert_eq!(unsafe { lance_blob_file_size(ptr::null()) }, 0);
+    assert_ne!(
+        lance_last_error_code(),
+        LanceErrorCode::Ok,
+        "size must report a NULL handle through the error channel"
+    );
+    assert_null_handle_reported();
+
+    let mut buffer = [0u8; 4];
+    assert_eq!(
+        unsafe { lance_blob_file_read(ptr::null_mut(), buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    assert_null_handle_reported();
+    let mut bytes_read = 0usize;
+    assert_eq!(
+        unsafe {
+            lance_blob_file_read_up_to(
+                ptr::null_mut(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut bytes_read,
+            )
+        },
+        -1
+    );
+    assert_null_handle_reported();
+    assert_eq!(
+        unsafe { lance_blob_file_read_range(ptr::null(), 0, buffer.as_mut_ptr(), buffer.len()) },
+        -1
+    );
+    assert_null_handle_reported();
+    assert_eq!(unsafe { lance_blob_file_seek(ptr::null_mut(), 0) }, -1);
+    assert_null_handle_reported();
+    let mut pos = 0u64;
+    assert_eq!(unsafe { lance_blob_file_tell(ptr::null(), &mut pos) }, -1);
+    assert_null_handle_reported();
+
+    // Closing NULL is a no-op.
+    unsafe { lance_blob_file_close(ptr::null_mut()) };
+}
+
+#[test]
+fn test_blob_close_keeps_the_pending_error_readable() {
+    let (_tmp, uri) = create_blob_v2_dataset(false);
+    let uri_c = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(uri_c.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let handles = take_all_blobs(ds);
+    let blob = handles[PACKED_BLOB_ROW];
+    let mut too_small = [0u8; 4];
+    assert_eq!(
+        unsafe { lance_blob_file_read(blob, too_small.as_mut_ptr(), too_small.len()) },
+        -1
+    );
+
+    // Closing must not clear an error the caller has not read yet.
+    unsafe { lance_blob_file_close(blob) };
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let message = take_last_error_message();
+    assert!(message.contains("dst_len 4"), "{message}");
+
+    let rest = handles
+        .iter()
+        .copied()
+        .filter(|handle| *handle != blob)
+        .collect::<Vec<_>>();
+    close_blob_handles(&rest);
+    unsafe { lance_dataset_close(ds) };
 }

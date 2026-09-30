@@ -7,7 +7,7 @@
  *
  * Tests the RAII wrappers, exception handling, and builder pattern.
  *
- * Usage: test_cpp_api <dataset_uri> <write_uri>
+ * Usage: test_cpp_api <dataset_uri> <write_uri> <blob_uri>
  */
 
 #include "lance/lance.hpp"
@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -68,6 +69,37 @@ static void capture_async_scan(
         captured->completed = true;
     }
     captured->ready.notify_one();
+}
+
+struct BuildProgressCapture {
+    uint64_t events = 0;
+    uint64_t starts = 0;
+    uint64_t completes = 0;
+    bool invalid = false;
+};
+
+static void capture_build_progress(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed) noexcept {
+    (void)total;
+    (void)completed;
+    if (!callback_ctx) return;
+    auto* captured = static_cast<BuildProgressCapture*>(callback_ctx);
+    if (!stage || !unit) {
+        captured->invalid = true;
+        return;
+    }
+    if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_START)
+        captured->starts += 1;
+    else if (event == LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE)
+        captured->completes += 1;
+    else if (event != LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS)
+        captured->invalid = true;
+    captured->events += 1;
 }
 
 static void test_dataset_open(const std::string& uri) {
@@ -162,6 +194,11 @@ static void test_scanner_fluent(const std::string& uri) {
            .fragment_readahead(1)
            .target_parallelism(1)
            .scan_in_order(false)
+           .use_scalar_index(false)
+           .strict_batch_size(false)
+           .use_stats(false)
+           .with_row_address(true)
+           .include_deleted_rows(false)
            .statistics_callback(capture_scan_statistics, &captured);
 
     ArrowArrayStream stream;
@@ -227,6 +264,142 @@ static void test_scanner_async_stream_ownership(const std::string& uri) {
     // library-allocated outer structure. It is also explicitly NULL-safe.
     lance::scanner_async_stream_free(stream);
     lance::scanner_async_stream_free(nullptr);
+
+    PASS();
+}
+
+/// Arrow C Data Interface format of the `blob` column in a stream's schema,
+/// or an empty string when the column is missing.
+static std::string blob_column_format(ArrowArrayStream& stream) {
+    ArrowSchema schema;
+    memset(&schema, 0, sizeof(schema));
+    int rc = stream.get_schema(&stream, &schema);
+    assert(rc == 0);
+    std::string format;
+    for (int64_t i = 0; i < schema.n_children; i++) {
+        if (strcmp(schema.children[i]->name, "blob") == 0) {
+            format = schema.children[i]->format;
+        }
+    }
+    if (schema.release) schema.release(&schema);
+    return format;
+}
+
+static void test_scanner_blob_handling(const std::string& blob_uri) {
+    TEST(test_scanner_blob_handling);
+
+    auto ds = lance::Dataset::open(blob_uri);
+
+    // By default a blob column arrives as its description struct ("+s").
+    {
+        auto scanner = ds.scan();
+        ArrowArrayStream stream;
+        memset(&stream, 0, sizeof(stream));
+        scanner.to_arrow_stream(&stream);
+        assert(blob_column_format(stream) == "+s");
+        if (stream.release) stream.release(&stream);
+    }
+
+    // ALL_BINARY: LargeBinary ("Z"), and every row is still returned.
+    auto scanner = ds.scan();
+    scanner.blob_handling(LANCE_BLOB_HANDLING_ALL_BINARY);
+    ArrowArrayStream stream;
+    memset(&stream, 0, sizeof(stream));
+    scanner.to_arrow_stream(&stream);
+    assert(blob_column_format(stream) == "Z");
+
+    uint64_t total = 0;
+    while (true) {
+        ArrowArray arr;
+        memset(&arr, 0, sizeof(arr));
+        int rc = stream.get_next(&stream, &arr);
+        assert(rc == 0);
+        if (!arr.release) break;
+        total += (uint64_t)arr.length;
+        arr.release(&arr);
+    }
+    assert(total == ds.count_rows());
+    if (stream.release) stream.release(&stream);
+
+    // Once the scan has started the setting is rejected.
+    bool caught = false;
+    try {
+        scanner.blob_handling(LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS);
+    } catch (const lance::Error& e) {
+        caught = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    printf("rows=%llu... ", (unsigned long long)total);
+    PASS();
+}
+
+/// Byte `i` of every blob payload in the smoke fixture.
+static uint8_t blob_byte(size_t i) { return static_cast<uint8_t>(i * 7 + 3); }
+
+/// Check that `bytes` are the payload bytes starting at `offset`.
+static void assert_blob_payload(const std::vector<uint8_t>& bytes, size_t offset) {
+    for (size_t i = 0; i < bytes.size(); i++) {
+        assert(bytes[i] == blob_byte(offset + i));
+    }
+}
+
+static void test_take_blobs(const std::string& blob_uri) {
+    TEST(test_take_blobs);
+
+    std::vector<std::optional<lance::BlobFile>> survivors;
+    {
+        auto ds = lance::Dataset::open(blob_uri);
+
+        // The first fragment holds an inline, a packed, a dedicated, an empty
+        // and a null blob, in that order.
+        uint64_t indices[] = {0, 1, 2, 3, 4};
+        auto blobs = ds.take_blobs_by_indices(indices, 5, "blob");
+        assert(blobs.size() == 5);
+        const uint64_t sizes[] = {8, 128, 1024, 0};
+        for (size_t i = 0; i < 4; i++) {
+            assert(blobs[i].has_value());
+            assert(blobs[i]->size() == sizes[i]);
+            assert_blob_payload(blobs[i]->read(), 0);
+            assert(blobs[i]->tell() == sizes[i]);
+        }
+        assert(!blobs[4].has_value());
+
+        // Cursor and positional reads on the packed blob.
+        lance::BlobFile& packed = *blobs[1];
+        packed.seek(100);
+        auto tail = packed.read_up_to(64);
+        assert(tail.size() == 28);
+        assert_blob_payload(tail, 100);
+        assert(packed.tell() == 128);
+        auto window = packed.read_range(40, 16);
+        assert(window.size() == 16);
+        assert_blob_payload(window, 40);
+        assert(packed.tell() == 128);
+
+        // The same column by row ID. Without stable row ids a row id is the
+        // row address, so the second fragment starts at 1 << 32.
+        uint64_t row_ids[] = {0, (uint64_t{1} << 32) | 2};
+        survivors = ds.take_blobs(row_ids, 2, "blob");
+        assert(survivors.size() == 2);
+        assert(survivors[0]->size() == 8);
+        assert(survivors[1]->size() == 1024);
+
+        // A column that is not a blob column is rejected.
+        bool caught = false;
+        try {
+            ds.take_blobs_by_indices(indices, 5, "raw");
+        } catch (const lance::Error& e) {
+            caught = true;
+            assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(caught);
+    }
+
+    // Handles stay readable after the Dataset is gone.
+    assert_blob_payload(survivors[1]->read(), 0);
+    assert(survivors[1]->tell() == 1024);
 
     PASS();
 }
@@ -398,6 +571,9 @@ static void test_nearest_smoke(const std::string& uri) {
     try {
         scanner.nearest("embedding", q, 8, 5)
                .nprobes(2)
+               .minimum_nprobes(1)
+               .maximum_nprobes(2)
+               .approx_mode(LANCE_APPROX_MODE_NORMAL)
                .query_parallelism(2)
                .refine_factor(1)
                .ef(50)
@@ -416,6 +592,20 @@ static void test_nearest_smoke(const std::string& uri) {
     // Either path is fine — we proved compile + linkage + the fluent chain.
     (void)caught;
 
+    PASS();
+}
+
+static void test_multivector_rejects_flat_column(const std::string& uri) {
+    TEST(test_multivector_rejects_flat_column);
+    auto scanner = lance::Dataset::open(uri).scan();
+    const float query[8] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    bool caught = false;
+    try {
+        scanner.nearest_multivector("embedding", query, 8, 1, LANCE_DTYPE_FLOAT32, 1);
+    } catch (const lance::Error&) {
+        caught = true;
+    }
+    assert(caught);
     PASS();
 }
 
@@ -497,6 +687,35 @@ static void test_index_segment_builder(const std::string& uri) {
     PASS();
 }
 
+static void test_index_segment_builder_progress(const std::string& uri) {
+    TEST(test_index_segment_builder_progress);
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(all_ids.size() >= 2);
+    std::vector<uint32_t> fragment_ids;
+    for (auto id : all_ids) fragment_ids.push_back(static_cast<uint32_t>(id));
+
+    LanceVectorIndexParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 2, 0, 0, 16,
+    };
+    LanceIndexSegmentBuildOptions options = {};
+    options.fragment_ids = fragment_ids.data();
+    options.fragment_count = fragment_ids.size();
+    options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+
+    BuildProgressCapture captured;
+    auto builder = ds.new_vector_index_segment_builder(
+        "embedding", params, "cpp_progress_idx", &options);
+    builder.progress_callback(capture_build_progress, &captured);
+    auto bytes = builder.execute_uncommitted();
+
+    assert(!bytes.empty());
+    assert(captured.events > 0);
+    assert(captured.starts > 0 && captured.completes > 0);
+    assert(!captured.invalid);
+    PASS();
+}
+
 static void test_vector_models_and_reusable_segments(const std::string& uri) {
     TEST(test_vector_models_and_reusable_segments);
     auto ds = lance::Dataset::open(uri);
@@ -530,6 +749,68 @@ static void test_vector_models_and_reusable_segments(const std::string& uri) {
         assert(centroids.array()->release != nullptr);
         assert(codebook.array()->release != nullptr);
     }
+    PASS();
+}
+
+static void test_commit_index_segments(const std::string& uri) {
+    TEST(test_commit_index_segments);
+
+    auto ds = lance::Dataset::open(uri);
+    auto all_ids = ds.fragment_ids();
+    assert(all_ids.size() >= 2);
+
+    LanceVectorIndexParams params = {
+        LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 2, 0, 0, 16,
+    };
+
+    // Build one uncommitted segment per fragment (the distributed workers).
+    std::vector<std::vector<uint8_t>> segments;
+    std::vector<std::array<uint8_t, 16>> expected_uuids;
+    for (size_t i = 0; i < 2; ++i) {
+        uint32_t fragment_id = static_cast<uint32_t>(all_ids[i]);
+        LanceIndexSegmentBuildOptions options = {};
+        options.fragment_ids = &fragment_id;
+        options.fragment_count = 1;
+        options.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+        auto builder = ds.new_vector_index_segment_builder(
+            "embedding", params, "cpp_distributed_idx", &options);
+        segments.push_back(builder.execute_uncommitted());
+        auto metadata = lance::IndexSegmentMetadata::parse(segments.back());
+        expected_uuids.push_back(metadata.uuid());
+    }
+
+    // One commit registers both segments as a single logical index.
+    uint64_t version_before = ds.version();
+    ds.commit_index_segments("cpp_distributed_idx", "embedding", segments);
+    assert(ds.version() == version_before + 1);
+    assert(ds.index_segment_count("cpp_distributed_idx") == 2);
+    auto committed = ds.index_segments("cpp_distributed_idx");
+    assert(committed.size() == 2);
+    for (size_t i = 0; i < 2; ++i) assert(committed[i] == expected_uuids[i]);
+
+    // Duplicate segment UUIDs in the commit set are rejected.
+    bool caught = false;
+    try {
+        ds.commit_index_segments(
+            "cpp_dup_idx", "embedding", {segments[0], segments[0]});
+    } catch (const lance::Error& e) {
+        caught = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+
+    // An empty commit set is rejected.
+    caught = false;
+    try {
+        ds.commit_index_segments(
+            "cpp_empty_idx", "embedding", {});
+    } catch (const lance::Error& e) {
+        caught = true;
+        assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+    }
+    assert(caught);
+    assert(ds.version() == version_before + 1);
+
     PASS();
 }
 
@@ -940,13 +1221,14 @@ static void test_delete_rows(const std::string& dst_uri) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri>\n", argv[0]);
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
         return 1;
     }
 
     std::string uri(argv[1]);
     std::string write_uri(argv[2]);
+    std::string blob_uri(argv[3]);
     printf("Running C++ API tests with dataset: %s\n", uri.c_str());
 
     test_dataset_open(uri);
@@ -955,6 +1237,8 @@ int main(int argc, char** argv) {
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
     test_scanner_async_stream_ownership(uri);
+    test_scanner_blob_handling(blob_uri);
+    test_take_blobs(blob_uri);
     test_dataset_take(uri);
     test_dataset_take_rows(uri);
     test_raii_cleanup(uri);
@@ -963,9 +1247,12 @@ int main(int argc, char** argv) {
     test_error_exception(uri);
     test_index_lifecycle(uri);
     test_nearest_smoke(uri);
+    test_multivector_rejects_flat_column(uri);
     test_index_segments_smoke(uri);
     test_index_segment_builder(uri);
+    test_index_segment_builder_progress(uri);
     test_vector_models_and_reusable_segments(uri);
+    test_commit_index_segments(uri);
     test_fts_smoke(uri);
     test_dataset_write_roundtrip(uri, write_uri);
     test_data_statistics(write_uri);
