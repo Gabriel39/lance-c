@@ -10,17 +10,15 @@ use std::time::Instant;
 
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use lance::Dataset;
-use lance::dataset::scanner::{
-    ExecutionStatsCallback, ExecutionSummaryCounts, RowAddrMask, Scanner,
-};
+use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance::io::exec::utils::IndexMetrics;
 use lance_core::{Error, Result};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::MetricsExt;
 use lance_index::IndexType;
-use lance_index::scalar::SearchResult;
-use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr, ScalarIndexSearch};
+use lance_index::scalar::expression::{PlannerIndexExt, ScalarIndexExpr, ScalarIndexLoader};
+use lance_index::scalar::{MetricsCollector, ScalarIndex};
 use uuid::Uuid;
 
 pub(crate) struct PreparedScalarSegment {
@@ -35,15 +33,83 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::invalid_input_source(message.into().into())
 }
 
-// Only descend through AND: a leaf below OR or NOT need not contain all matches
-// of the full expression. The original expression is always reapplied by reader.
-fn driver<'a>(expr: &'a ScalarIndexExpr, index_name: &str) -> Option<&'a ScalarIndexSearch> {
+// Bound both recursive planning and the concurrent searches in Lance's evaluator.
+const MAX_EXPRESSION_NODES: usize = 128;
+const MAX_EXPRESSION_DEPTH: usize = 32;
+
+fn scoped_expression(
+    expr: &ScalarIndexExpr,
+    index_name: &str,
+    column: &str,
+    require_complete: bool,
+    depth: usize,
+    remaining: &mut usize,
+) -> std::result::Result<Option<ScalarIndexExpr>, &'static str> {
+    if depth > MAX_EXPRESSION_DEPTH || *remaining == 0 {
+        return Err("expression_budget");
+    }
+    *remaining -= 1;
+    let recurse = |child, complete, remaining: &mut usize| {
+        scoped_expression(child, index_name, column, complete, depth + 1, remaining)
+    };
     match expr {
-        ScalarIndexExpr::Query(search) if search.index_name == index_name => Some(search),
-        ScalarIndexExpr::And(lhs, rhs) => {
-            driver(lhs, index_name).or_else(|| driver(rhs, index_name))
+        ScalarIndexExpr::Query(search) => {
+            if search.index_name != index_name {
+                Ok(None)
+            } else if search.column != column {
+                Err("field_path")
+            } else {
+                Ok(Some(expr.clone()))
+            }
         }
-        _ => None,
+        ScalarIndexExpr::And(lhs, rhs) => {
+            let lhs = recurse(lhs, require_complete, remaining)?;
+            let rhs = recurse(rhs, require_complete, remaining)?;
+            Ok(match (lhs, rhs) {
+                (Some(lhs), Some(rhs)) => Some(ScalarIndexExpr::And(Box::new(lhs), Box::new(rhs))),
+                (lhs, rhs) if !require_complete => lhs.or(rhs),
+                _ => None,
+            })
+        }
+        ScalarIndexExpr::Or(lhs, rhs) => {
+            let lhs = recurse(lhs, require_complete, remaining)?;
+            let rhs = recurse(rhs, require_complete, remaining)?;
+            // Both branches must contribute a superset of their matches. Dropping
+            // an unavailable OR branch would silently exclude valid rows.
+            Ok(lhs
+                .zip(rhs)
+                .map(|(lhs, rhs)| ScalarIndexExpr::Or(Box::new(lhs), Box::new(rhs))))
+        }
+        ScalarIndexExpr::Not(inner) => {
+            // Negating a pruned AND would turn a safe superset into an unsafe
+            // subset. Preserve the complete subtree and let Lance track NULLs.
+            Ok(recurse(inner, true, remaining)?.map(|inner| ScalarIndexExpr::Not(Box::new(inner))))
+        }
+    }
+}
+
+struct SegmentIndexLoader<'a> {
+    index: Arc<dyn ScalarIndex>,
+    index_name: &'a str,
+    column: &'a str,
+}
+
+#[async_trait::async_trait]
+impl ScalarIndexLoader for SegmentIndexLoader<'_> {
+    async fn load_index(
+        &self,
+        column: &str,
+        index_name: &str,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if column != self.column || index_name != self.index_name {
+            return Err(invalid(
+                "scalar expression references an index outside the selected segment",
+            ));
+        }
+        // Reuse the one physical segment; a dataset loader would search every
+        // segment of the logical index and violate the caller's restriction.
+        Ok(self.index.clone())
     }
 }
 
@@ -208,19 +274,25 @@ impl PreparedScalarSegment {
         let planner = Planner::new(Arc::new(stored_schema));
         let index_info = self.dataset.scalar_index_info().await?;
         let filter_plan = planner.create_filter_plan(filter, &index_info, true)?;
-        let Some(search) = filter_plan
-            .index_query
-            .as_ref()
-            .and_then(|expr| driver(expr, &index_meta.name))
-        else {
+        let Some(expr) = filter_plan.index_query.as_ref() else {
             return Ok(Some("no_driver"));
         };
-        if search.column != field.name {
-            return Ok(Some("field_path"));
-        }
+        let mut remaining = MAX_EXPRESSION_NODES;
+        let expr = match scoped_expression(
+            expr,
+            &index_meta.name,
+            &field.name,
+            false,
+            0,
+            &mut remaining,
+        ) {
+            Ok(Some(expr)) => expr,
+            Ok(None) => return Ok(Some("no_driver")),
+            Err(reason) => return Ok(Some(reason)),
+        };
         let index = self
             .dataset
-            .open_scalar_index(&search.column, &self.segment_uuid, metrics)
+            .open_scalar_index(&field.name, &self.segment_uuid, metrics)
             .await?;
         // These implementations can return exact candidates. Keep the runtime
         // Exact check below: a type alone is not a guarantee for every query.
@@ -235,7 +307,12 @@ impl PreparedScalarSegment {
             return Ok(Some("row_id_domain"));
         }
         let started = Instant::now();
-        let result = index.search(search.query.as_ref(), metrics).await?;
+        let loader = SegmentIndexLoader {
+            index,
+            index_name: &index_meta.name,
+            column: &field.name,
+        };
+        let result = expr.evaluate(&loader, metrics).await?;
         stats.all_times.insert(
             "scalar_segment_search_time".into(),
             started.elapsed().as_nanos().min(usize::MAX as u128) as usize,
@@ -243,18 +320,75 @@ impl PreparedScalarSegment {
         stats
             .all_counts
             .insert("scalar_segments_searched".into(), 1);
-        let SearchResult::Exact(rows) = result else {
+        if !result.is_exact() {
             return Ok(Some("inexact_result"));
-        };
-        stats.all_counts.insert(
-            "scalar_segment_candidate_rows".into(),
-            rows.len().unwrap_or(0) as usize,
-        );
+        }
+        if let Some(rows) = result.upper.max_len() {
+            stats
+                .all_counts
+                .insert("scalar_segment_candidate_rows".into(), rows as usize);
+        } else {
+            // A complement mask has no finite cardinality without a row universe.
+            // Do not report zero candidates for a successful NOT search.
+            stats
+                .all_counts
+                .insert("scalar_segment_candidate_rows_unknown".into(), 1);
+        }
         // Do not truncate candidates at LIMIT. The reader evaluates the complete
-        // filter before applying its existing limit/offset operators.
-        // The raw selected bitmap can overlap NULL rows; the full filter removes
-        // those as well. The metric above counts semantic TRUE rows, not mask size.
-        reader.with_row_addr_prefilter(RowAddrMask::from_allowed(rows.selected_rows().clone()));
+        // filter before applying its existing limit/offset operators. Its explicit
+        // fragment domain also bounds complement masks produced by NOT.
+        reader.with_row_addr_prefilter(result.upper);
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_index::scalar::SargableQuery;
+    use lance_index::scalar::expression::ScalarIndexSearch;
+
+    fn leaf(index_name: &str) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "key".into(),
+            index_name: index_name.into(),
+            index_type: "BTree".into(),
+            query: Arc::new(SargableQuery::IsNull()),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
+    fn select(
+        expr: &ScalarIndexExpr,
+    ) -> std::result::Result<Option<ScalarIndexExpr>, &'static str> {
+        let mut remaining = MAX_EXPRESSION_NODES;
+        scoped_expression(expr, "selected", "key", false, 0, &mut remaining)
+    }
+
+    #[test]
+    fn never_negate_a_partial_candidate_expression() {
+        let partial = ScalarIndexExpr::And(Box::new(leaf("selected")), Box::new(leaf("other")));
+        assert!(select(&partial).unwrap().is_some());
+        let negated = ScalarIndexExpr::Not(Box::new(partial));
+        assert!(select(&negated).unwrap().is_none());
+        let alternative = ScalarIndexExpr::Or(Box::new(leaf("selected")), Box::new(negated));
+        assert!(select(&alternative).unwrap().is_none());
+    }
+
+    #[test]
+    fn expression_budget_bounds_depth_and_concurrent_searches() {
+        let mut deep = leaf("selected");
+        for _ in 0..=MAX_EXPRESSION_DEPTH {
+            deep = ScalarIndexExpr::Not(Box::new(deep));
+        }
+        assert_eq!(select(&deep).unwrap_err(), "expression_budget");
+        let mut wide = leaf("selected");
+        for _ in 0..6 {
+            wide = ScalarIndexExpr::Or(Box::new(wide.clone()), Box::new(wide));
+        }
+        assert!(select(&wide).unwrap().is_some());
+        wide = ScalarIndexExpr::Or(Box::new(wide.clone()), Box::new(wide));
+        assert_eq!(select(&wide).unwrap_err(), "expression_budget");
     }
 }

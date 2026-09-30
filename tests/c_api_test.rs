@@ -15287,6 +15287,190 @@ fn test_scalar_segment_scope_residual_limit_and_unindexed_fallback() {
 }
 
 #[test]
+fn test_scalar_segment_boolean_predicates_preserve_scope_and_nulls() {
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        for stable in [false, true] {
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_with_options(kind, stable, None, &[&[0, 1], &[2]]);
+            for (filter, expected) in [
+                ("key IN (1, 2)", vec![1, 2, 5, 7]),
+                ("key = 1 OR key = 2", vec![1, 2, 5, 7]),
+                ("key IN (0, 1, 2)", vec![1, 2, 3, 5, 6, 7]),
+                ("key IN (0, 1, 2, 99)", vec![1, 2, 3, 5, 6, 7]),
+                ("key IN (1, 2) AND id >= 2", vec![2, 5, 7]),
+                ("(key = 1 OR key = 2) AND key > 1", vec![2, 5]),
+                ("NOT (key = 1 OR key = 2)", vec![3, 6]),
+                ("key NOT IN (1, 2)", vec![3, 6]),
+                ("key IS NULL OR key = 1", vec![0, 1, 4, 7]),
+                ("key = 98 OR key = 99", vec![]),
+            ] {
+                let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], filter, None, 0);
+                assert_eq!(ids, expected, "{kind:?}, stable={stable}, {filter}");
+                assert_eq!(stats.calls, 1);
+                assert!(
+                    stats
+                        .metrics
+                        .iter()
+                        .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1),
+                    "{kind:?}, stable={stable}, {filter}: {:?}",
+                    stats.metrics
+                );
+                assert!(
+                    !stats
+                        .metrics
+                        .iter()
+                        .any(|(name, _, value)| name == "scalar_segment_fallbacks" && *value != 0),
+                    "{kind:?}, stable={stable}, {filter}: {:?}",
+                    stats.metrics
+                );
+            }
+            let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0], "key IN (1, 2)", None, 0);
+            assert_eq!(
+                ids,
+                vec![1, 2],
+                "index coverage must not widen the scan scope"
+            );
+            let (ids, _) = scalar_segment_ids(
+                &uri,
+                &uuids[0],
+                &[0, 1],
+                "key IN (1, 2) AND id >= 2",
+                Some(1),
+                1,
+            );
+            assert_eq!(ids, vec![5], "residual filtering must precede pagination");
+            let (ids, stats) =
+                scalar_segment_ids(&uri, &uuids[0], &[0, 2], "key IN (1, 2)", None, 0);
+            assert_eq!(ids, vec![1, 2, 10, 11]);
+            assert!(stats.metrics.iter().any(|(name, _, value)| name
+                == "scalar_segment_fallback_partial_coverage"
+                && *value == 1));
+            // A missing OR branch cannot be discarded, even if the other branch is indexed.
+            let (ids, stats) =
+                scalar_segment_ids(&uri, &uuids[0], &[0, 1], "key IN (1, 2) OR id = 0", None, 0);
+            assert_eq!(ids, vec![0, 1, 2, 5, 7]);
+            assert!(stats.metrics.iter().any(|(name, _, value)| name
+                == "scalar_segment_fallback_no_driver"
+                && *value == 1));
+            for (filter, expected) in [
+                ("key IN (1, NULL)", vec![1, 7]),
+                ("key NOT IN (1, NULL)", vec![]),
+                ("NOT (key = 1 OR id = 2)", vec![3, 5, 6]),
+            ] {
+                let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], filter, None, 0);
+                assert_eq!(ids, expected, "{kind:?}, stable={stable}, {filter}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_string_in_candidates_and_deleted_rows() {
+    use lance::index::DatasetIndexExt;
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        for stable in [false, true] {
+            let key = Arc::new(StringArray::from(vec![
+                None,
+                Some("alpha"),
+                Some("beta"),
+                Some("gamma"),
+                None,
+                Some("beta"),
+                Some("gamma"),
+                Some("alpha"),
+                None,
+                Some("gamma"),
+                Some("alpha"),
+                Some("beta"),
+            ]));
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_from_key(kind, stable, None, &[&[0, 1], &[2]], key);
+            let (ids, stats) = scalar_segment_ids(
+                &uri,
+                &uuids[0],
+                &[0, 1],
+                "key IN ('alpha', 'beta')",
+                None,
+                0,
+            );
+            assert_eq!(ids, vec![1, 2, 5, 7]);
+            assert!(
+                stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| name == "scalar_segment_candidate_rows" && *value == 4)
+            );
+            assert!(
+                stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| name == "rows_scanned" && *value == 4)
+            );
+            lance_c::runtime::block_on(async {
+                let mut ds = Dataset::open(&uri).await.unwrap();
+                ds.delete("id IN (1, 6)").await.unwrap();
+                assert_eq!(ds.load_indices().await.unwrap().len(), 2);
+            });
+            for (filter, expected) in [
+                ("key IN ('alpha', 'beta')", vec![2, 5, 7]),
+                ("NOT (key = 'alpha' OR key = 'beta')", vec![3]),
+            ] {
+                let (ids, _) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], filter, None, 0);
+                assert_eq!(ids, expected, "{kind:?}, stable={stable}, {filter}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_scalar_segment_boolean_predicates_do_not_search_other_indices() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    let (_tmp, uri, uuids) = create_scalar_segment_fixture_with_options(
+        lance_index::IndexType::BTree,
+        false,
+        None,
+        &[&[0, 1], &[2]],
+    );
+    lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.create_index_builder(
+            &["id"],
+            lance_index::IndexType::BTree,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+        )
+        .name("id_idx".into())
+        .await
+        .unwrap();
+    });
+    for (filter, expected, accelerated) in [
+        ("key = 1 AND id >= 2", vec![7], true),
+        (
+            "(key = 1 AND id >= 2) OR (key = 2 AND id < 6)",
+            vec![2, 5, 7],
+            true,
+        ),
+        ("key = 1 OR id = 0", vec![0, 1, 7], false),
+        // Negating a necessary conjunct alone would incorrectly drop id 0 and 1.
+        ("NOT (key = 1 AND id >= 2)", vec![0, 1, 2, 3, 5, 6], false),
+    ] {
+        let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], filter, None, 0);
+        assert_eq!(ids, expected, "{filter}");
+        let searched = stats
+            .metrics
+            .iter()
+            .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1);
+        assert_eq!(searched, accelerated, "{filter}: {:?}", stats.metrics);
+    }
+}
+
+#[test]
 fn test_scalar_segment_metadata_residuals_fall_back_within_scope() {
     for kind in [
         lance_index::IndexType::BTree,

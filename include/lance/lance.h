@@ -2256,13 +2256,16 @@ int32_t lance_scanner_set_index_segments(
  * fragment domains and separately include any unindexed data they wish to read.
  * The segment metadata must identify one key field present in the schema.
  *
- * BTree/Bitmap/LabelList searches use a necessary AND-conjunct of the
- * full scanner filter on the selected logical index and require an Exact result.
+ * BTree/Bitmap/LabelList searches evaluate a candidate expression on the selected
+ * logical index, including AND, OR, IN and NULL-aware NOT, and require an Exact
+ * result. An AND may retain only its supported necessary conditions. OR needs
+ * candidates for both branches; NOT requires its complete indexed subtree.
+ * Expressions exceeding 128 nodes or depth 32 use the scoped fallback.
  * use_scalar_index=false skips segment search and uses the scoped fallback;
  * snapshot UUID and fragment validation still applies.
  * AtMost/AtLeast results fall back to a full filtered scan of fragment_ids.
  * All predicates are reapplied during candidate reads; other scalar indices
- * are disabled. Legacy storage, OR/NOT-only filters,
+ * are disabled. Legacy storage, expressions without safe scoped candidates,
  * overlays, fragment reuse, unsupported index types / result domains
  * and missing coverage use the same domain without an index. No filter also
  * falls back. LIMIT/OFFSET apply after the complete scanner filter, never to the
