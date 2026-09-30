@@ -15368,6 +15368,73 @@ fn test_scalar_segment_boolean_predicates_preserve_scope_and_nulls() {
 }
 
 #[test]
+fn test_scalar_segment_boolean_truth_tests_preserve_null_rows() {
+    for kind in [
+        lance_index::IndexType::BTree,
+        lance_index::IndexType::Bitmap,
+    ] {
+        for stable in [false, true] {
+            let key = Arc::new(arrow_array::BooleanArray::from(vec![
+                None,
+                Some(true),
+                Some(false),
+                Some(false),
+                None,
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+                Some(false),
+                Some(true),
+                Some(false),
+            ]));
+            let (_tmp, uri, uuids) =
+                create_scalar_segment_fixture_from_key(kind, stable, None, &[&[0, 1], &[2]], key);
+            for (filter, expected) in [
+                ("NOT (key IS TRUE)", vec![0, 2, 3, 4, 6]),
+                ("NOT (key IS FALSE)", vec![0, 1, 4, 5, 7]),
+                ("key IS NOT TRUE", vec![0, 2, 3, 4, 6]),
+                ("key IS NOT FALSE", vec![0, 1, 4, 5, 7]),
+                ("key IS TRUE", vec![1, 5, 7]),
+                ("key IS FALSE", vec![2, 3, 6]),
+                ("NOT (key IS TRUE AND id >= 2)", vec![0, 1, 2, 3, 4, 6]),
+                ("NOT (key IS FALSE OR id = 0)", vec![1, 4, 5, 7]),
+                ("(key IS TRUE) = false", vec![0, 2, 3, 4, 6]),
+            ] {
+                let (ids, stats) = scalar_segment_ids(&uri, &uuids[0], &[0, 1], filter, None, 0);
+                assert_eq!(ids, expected, "{kind:?}, stable={stable}, {filter}");
+                assert_eq!(stats.calls, 1);
+                assert!(
+                    stats.metrics.iter().any(|(name, _, value)| name
+                        == "scalar_segment_fallback_boolean_truth_test"
+                        && *value == 1),
+                    "{filter}: {:?}",
+                    stats.metrics
+                );
+                assert!(
+                    !stats
+                        .metrics
+                        .iter()
+                        .any(|(name, _, value)| name == "scalar_segments_searched" && *value != 0)
+                );
+            }
+            let (ids, _) =
+                scalar_segment_ids(&uri, &uuids[0], &[0], "NOT (key IS TRUE)", Some(1), 1);
+            assert_eq!(ids, vec![2], "fallback must preserve scope and pagination");
+            let (ids, stats) =
+                scalar_segment_ids(&uri, &uuids[0], &[0, 1], "NOT (key = true)", None, 0);
+            assert_eq!(ids, vec![2, 3, 6], "ordinary NOT must still exclude NULLs");
+            assert!(
+                stats
+                    .metrics
+                    .iter()
+                    .any(|(name, _, value)| name == "scalar_segments_searched" && *value == 1)
+            );
+        }
+    }
+}
+
+#[test]
 fn test_scalar_segment_string_in_candidates_and_deleted_rows() {
     use lance::index::DatasetIndexExt;
     for kind in [

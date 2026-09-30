@@ -2261,6 +2261,8 @@ int32_t lance_scanner_set_index_segments(
  * result. An AND may retain only its supported necessary conditions. OR needs
  * candidates for both branches; NOT requires its complete indexed subtree.
  * Expressions exceeding 128 nodes or depth 32 use the scoped fallback.
+ * Filters containing IS [NOT] TRUE/FALSE also use that fallback until the Lance
+ * planner dependency preserves their NULL semantics under negation.
  * use_scalar_index=false skips segment search and uses the scoped fallback;
  * snapshot UUID and fragment validation still applies.
  * AtMost/AtLeast results fall back to a full filtered scan of fragment_ids.

@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use datafusion::common::tree_node::TreeNode;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use lance::Dataset;
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts, Scanner};
@@ -259,6 +261,18 @@ impl PreparedScalarSegment {
         let Some(filter) = reader.get_expr_filter()? else {
             return Ok(Some("no_filter"));
         };
+        // The pinned Lance planner lowers IS TRUE/FALSE to nullable equality.
+        // Under negation this loses matching NULL rows before the full recheck.
+        // Inspect the original expression before planning erases that distinction;
+        // remove this fallback only after adopting lance-format/lance#9568.
+        if filter.exists(|expr| {
+            Ok(matches!(
+                expr,
+                Expr::IsTrue(_) | Expr::IsFalse(_) | Expr::IsNotTrue(_) | Expr::IsNotFalse(_)
+            ))
+        })? {
+            return Ok(Some("boolean_truth_test"));
+        }
         let stored_schema: arrow_schema::Schema = self.dataset.schema().into();
         // get_expr_filter validates against the scanner's full filterable
         // schema, including metadata columns absent from the stored schema.
