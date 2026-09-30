@@ -2258,7 +2258,10 @@ int32_t lance_scanner_set_index_segments(
  *
  * BTree/Bitmap/LabelList searches evaluate a candidate expression on the selected
  * logical index, including AND, OR, IN and NULL-aware NOT, and require an Exact
- * result. An AND may retain only its supported necessary conditions. OR needs
+ * result. LabelList supports Lance array_has/array_contains, array_has_all and
+ * array_has_any through SQL or Substrait filters with matching list element types.
+ * These functions retain Lance semantics, including for NULL search values.
+ * An AND may retain only its supported necessary conditions. OR needs
  * candidates for both branches; NOT requires its complete indexed subtree.
  * Expressions exceeding 128 nodes or depth 32 use the scoped fallback.
  * Filters containing IS [NOT] TRUE/FALSE also use that fallback until the Lance

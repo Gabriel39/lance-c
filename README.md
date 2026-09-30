@@ -69,6 +69,47 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 
+## Segment-scoped array label filters
+
+Ordinary scans can use a `LabelList` index for array membership through the
+existing SQL and Substrait filter interfaces. For example, on a `List<Utf8>`
+column named `labels`:
+
+```sql
+array_contains(labels, 'red')
+array_contains(labels, 'red') AND array_contains(labels, 'blue')
+array_contains(labels, 'red') OR array_contains(labels, 'blue')
+array_has_all(labels, ['red', 'blue'])
+array_has_any(labels, ['red', 'blue'])
+```
+
+Configure `lance_scanner_set_fragment_ids` and
+`lance_scanner_set_scalar_index_segment` with the selected LabelList segment.
+Pass a SQL filter to `lance_scanner_new`, or attach a serialized Substrait
+`ExtendedExpression` with `lance_scanner_set_substrait_filter`. The Substrait
+schema must describe the list field and its element type; replacing that field
+with an unsupported-type placeholder cannot express a label predicate. Use
+Lance/DataFusion's `array_has` (the canonical name of `array_contains`),
+`array_has_all`, or `array_has_any` functions with correctly typed arguments.
+Substrait takes precedence over the primary SQL filter; use
+`lance_scanner_additional_sql_filter` when an additional condition must be ANDed
+with it.
+
+AND/OR membership expressions can reuse the same selected LabelList segment.
+Other columns remain residual filters, evaluated before LIMIT/OFFSET. This API
+selects one physical segment; it does not intersect indices on different columns.
+Incomplete segment coverage falls back to scanning the entire explicit fragment
+scope. Check `scalar_segments_searched` and `scalar_segment_fallbacks` in the
+statistics callback to distinguish index acceleration from filter execution.
+
+Bindings preserve Lance's function semantics, not the semantics of similarly
+named functions in another SQL engine. In particular, a NULL search value in
+`array_contains` does not match NULL array elements. `array_has_all` tests set
+containment, not an ordered contiguous subsequence. The pinned Lance version
+also treats an empty all-label query as true even for NULL lists. Integrators
+should initially push only non-NULL constant labels with matching element types
+and retain conditions whose semantics have not been verified in the calling engine.
+
 ## Distance-bounded vector search
 
 After configuring a single-vector nearest-neighbor query, use
