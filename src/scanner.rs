@@ -144,7 +144,53 @@ pub struct LanceScanner {
     schema: Option<SchemaRef>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NearestMode {
+    Single,
+    MultiVector,
+    Batch { num_queries: usize },
+}
+
+const MAX_BATCH_QUERIES: usize = 128;
+const MAX_BATCH_QUERY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BATCH_CANDIDATES: usize = 100_000;
+
+fn batch_query_value_count(dimension: usize, num_queries: usize, width: usize) -> Result<usize> {
+    // Check both products before constructing an FFI slice, including on 32-bit targets.
+    let overflow = || {
+        let message = format!(
+            "batch query byte size overflows usize: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        lance_core::Error::invalid_input_source(message.into())
+    };
+    let count = dimension.checked_mul(num_queries).ok_or_else(overflow)?;
+    let bytes = count.checked_mul(width).ok_or_else(overflow)?;
+    if bytes > MAX_BATCH_QUERY_BYTES {
+        let message = format!(
+            "batch query byte size {bytes} exceeds limit {MAX_BATCH_QUERY_BYTES}: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        return Err(lance_core::Error::invalid_input_source(message.into()));
+    }
+    Ok(count)
+}
+
+fn validate_batch_candidates(num_queries: usize, k: u32, refine_factor: Option<u32>) -> Result<()> {
+    let refine = refine_factor.unwrap_or(1) as usize;
+    if refine == 0
+        || num_queries
+            .checked_mul(k as usize)
+            .and_then(|n| n.checked_mul(refine))
+            .is_none_or(|n| n > MAX_BATCH_CANDIDATES)
+    {
+        return Err(lance_core::Error::invalid_input_source(format!(
+            "batch num_queries ({num_queries}) * k ({k}) * refine_factor ({refine}) must be in 1..={MAX_BATCH_CANDIDATES}"
+        ).into()));
+    }
+    Ok(())
+}
+
 struct NearestQuery {
+    mode: NearestMode,
     column: String,
     query: arrow_array::ArrayRef,
     k: u32,
@@ -371,12 +417,20 @@ impl LanceScanner {
         if let Some(handling) = &self.blob_handling {
             scanner.blob_handling(handling.clone());
         }
-        let multi_vector = self.nearest.as_ref().is_some_and(|query| {
-            matches!(
-                query.query.data_type(),
-                arrow_schema::DataType::FixedSizeList(_, _)
-            )
-        });
+        // Both batch and multi-vector inputs are matrices, but only multi-vector
+        // queries may use the custom row-level scoring and global result window.
+        let multi_vector = self
+            .nearest
+            .as_ref()
+            .is_some_and(|query| query.mode == NearestMode::MultiVector);
+        if let Some(NearestQuery {
+            mode: NearestMode::Batch { num_queries },
+            k,
+            ..
+        }) = &self.nearest
+        {
+            validate_batch_candidates(*num_queries, *k, self.refine_factor)?;
+        }
         if self.limit.is_some() || self.offset.is_some() {
             scanner.limit(self.limit, self.offset)?;
             if multi_vector {
@@ -1041,6 +1095,14 @@ unsafe fn scanner_set_limit_inner(scanner: *mut LanceScanner, limit: i64) -> Res
         ));
     }
     let s = unsafe { &mut *scanner };
+    if s.nearest
+        .as_ref()
+        .is_some_and(|q| matches!(q.mode, NearestMode::Batch { .. }))
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            "global limit is unsupported for batch nearest; apply windows per query_index in the caller".into(),
+        ));
+    }
     s.limit = Some(limit);
     Ok(0)
 }
@@ -1061,6 +1123,14 @@ unsafe fn scanner_set_offset_inner(scanner: *mut LanceScanner, offset: i64) -> R
         ));
     }
     let s = unsafe { &mut *scanner };
+    if s.nearest
+        .as_ref()
+        .is_some_and(|q| matches!(q.mode, NearestMode::Batch { .. }))
+    {
+        return Err(lance_core::Error::invalid_input_source(
+            "global offset is unsupported for batch nearest; apply windows per query_index in the caller".into(),
+        ));
+    }
     s.offset = Some(offset);
     Ok(0)
 }
@@ -2502,7 +2572,32 @@ macro_rules! scanner_set_u32 {
     };
 }
 
-scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
+/// Configure refinement without exceeding a batch query's candidate budget.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_refine_factor(
+    scanner: *mut LanceScanner,
+    value: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(
+        scanner,
+        (|| -> Result<i32> {
+            let s = unsafe { scanner.as_mut() }
+                .ok_or_else(|| lance_core::Error::invalid_input_source("scanner is NULL".into()))?;
+            if let Some(NearestQuery {
+                mode: NearestMode::Batch { num_queries },
+                k,
+                ..
+            }) = &s.nearest
+            {
+                s.ensure_scan_not_started("refine_factor")?;
+                validate_batch_candidates(*num_queries, *k, Some(value))?;
+            }
+            s.refine_factor = Some(value);
+            Ok(0)
+        })()
+    )
+}
 scanner_set_u32!(lance_scanner_set_ef, ef);
 
 /// Set inclusive lower and exclusive upper distance bounds on a single-vector query.
@@ -2536,14 +2631,11 @@ unsafe fn scanner_set_distance_range_inner(
         .nearest
         .as_mut()
         .ok_or_else(|| invalid("distance_range requires nearest() to be configured".into()))?;
-    // Multi-vector scores aggregate subvectors; filtering each subvector's
-    // candidates would not enforce the requested range on the final score.
-    if matches!(
-        nearest.query.data_type(),
-        arrow_schema::DataType::FixedSizeList(_, _)
-    ) {
+    // Range bounds are currently a single-query contract. Both batch and
+    // multi-vector queries use matrices, so check the explicit mode.
+    if nearest.mode != NearestMode::Single {
         return Err(invalid(
-            "distance_range does not support multi-vector queries".into(),
+            "distance_range requires a single-vector nearest query".into(),
         ));
     }
     let lower_bound = unsafe { lower_bound.as_ref() }.copied();
@@ -2913,8 +3005,156 @@ unsafe fn scanner_nearest_inner(
     let query = unsafe { decode_query_values(query_data, query_len, element_type)? };
 
     s.nearest = Some(NearestQuery {
+        mode: NearestMode::Single,
         column: column_str.to_string(),
         query,
+        k,
+        lower_bound: None,
+        upper_bound: None,
+    });
+    Ok(0)
+}
+
+/// Set independent nearest-neighbor queries copied from a row-major matrix.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_nearest_batch(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_queries: usize,
+    element_type: i32,
+    k: u32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        nearest_batch_inner(
+            scanner,
+            column,
+            query_data,
+            dimension,
+            num_queries,
+            element_type,
+            k,
+        )
+    })
+}
+
+unsafe fn nearest_batch_inner(
+    scanner: *mut LanceScanner,
+    column: *const c_char,
+    query_data: *const c_void,
+    dimension: usize,
+    num_queries: usize,
+    element_type: i32,
+    k: u32,
+) -> Result<i32> {
+    use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
+    use arrow_schema::{DataType, Field};
+    let invalid = |message: String| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() || column.is_null() || query_data.is_null() {
+        return Err(invalid(
+            "scanner, column, and query_data must not be NULL".into(),
+        ));
+    }
+    let s = unsafe { &mut *scanner };
+    s.ensure_scan_not_started("nearest_batch")?;
+    if dimension == 0 || dimension > i32::MAX as usize || k == 0 {
+        return Err(invalid(format!(
+            "dimension ({dimension}) and k ({k}) must be positive; dimension must fit int32"
+        )));
+    }
+    if num_queries == 0 || num_queries > MAX_BATCH_QUERIES {
+        return Err(invalid(format!(
+            "num_queries ({num_queries}) must be in 1..={MAX_BATCH_QUERIES}"
+        )));
+    }
+    if s.fts_query.is_some() || s.fts_context.is_some() {
+        return Err(invalid(
+            "batch nearest and full-text search are mutually exclusive".into(),
+        ));
+    }
+    if s.limit.is_some() || s.offset.is_some() {
+        return Err(invalid("batch nearest does not support global limit/offset; apply windows per query_index in the caller".into()));
+    }
+    validate_batch_candidates(num_queries, k, s.refine_factor)?;
+    let (data_type, width) = match element_type {
+        0 => (DataType::Float32, 4),
+        1 => (DataType::Float16, 2),
+        2 => (DataType::Float64, 8),
+        3 => (DataType::UInt8, 1),
+        4 => (DataType::Int8, 1),
+        _ => {
+            return Err(invalid(format!(
+                "batch element_type ({element_type}) must be float16, float32, float64, uint8, or int8"
+            )));
+        }
+    };
+    let count = batch_query_value_count(dimension, num_queries, width)?;
+    let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
+    if s.dataset.schema().field("query_index").is_some() {
+        return Err(invalid(
+            "batch nearest reserves the dataset column name query_index".into(),
+        ));
+    }
+    let field = s
+        .dataset
+        .schema()
+        .field(column)
+        .ok_or_else(|| invalid(format!("batch vector column {column:?} does not exist")))?;
+    match field.data_type() {
+        DataType::FixedSizeList(element, dim)
+            if dim == dimension as i32 && *element.data_type() == data_type => {}
+        actual => {
+            return Err(invalid(format!(
+                "batch column {column:?} must be FixedSizeList<{data_type}, {dimension}>, got {actual}"
+            )));
+        }
+    }
+    let values = unsafe { decode_query_values(query_data, count, element_type)? };
+    let finite = match values.data_type() {
+        DataType::Float16 => values
+            .as_any()
+            .downcast_ref::<Float16Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(|v| v.is_finite())),
+        DataType::Float32 => values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(f32::is_finite)),
+        DataType::Float64 => values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_some_and(f64::is_finite)),
+        DataType::UInt8 | DataType::Int8 => true,
+        actual => {
+            // A future decoder type must return an input error instead of poisoning the scanner.
+            return Err(invalid(format!(
+                "unsupported batch query data type {actual} for element_type={element_type}"
+            )));
+        }
+    };
+    if !finite {
+        return Err(invalid(
+            "batch query values must be finite and non-null".into(),
+        ));
+    }
+    // Keep the matrix shape even for one query: Lance uses it to emit query_index.
+    let query = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", data_type, false)),
+        dimension as i32,
+        values,
+        None,
+    )?;
+    s.nearest = Some(NearestQuery {
+        mode: NearestMode::Batch { num_queries },
+        column: column.to_string(),
+        query: Arc::new(query),
         k,
         lower_bound: None,
         upper_bound: None,
@@ -2927,18 +3167,29 @@ unsafe fn decode_query_values(
     query_len: usize,
     element_type: i32,
 ) -> Result<arrow_array::ArrayRef> {
-    let dtype = match element_type {
-        0 => LanceDataType::Float32,
-        1 => LanceDataType::Float16,
-        2 => LanceDataType::Float64,
-        3 => LanceDataType::UInt8,
-        4 => LanceDataType::Int8,
+    let (dtype, alignment) = match element_type {
+        0 => (LanceDataType::Float32, std::mem::align_of::<f32>()),
+        1 => (LanceDataType::Float16, std::mem::align_of::<half::f16>()),
+        2 => (LanceDataType::Float64, std::mem::align_of::<f64>()),
+        3 => (LanceDataType::UInt8, std::mem::align_of::<u8>()),
+        4 => (LanceDataType::Int8, std::mem::align_of::<i8>()),
         _ => {
             return Err(lance_core::Error::invalid_input_source(
                 format!("invalid element_type: {}", element_type).into(),
             ));
         }
     };
+
+    // from_raw_parts requires alignment even when the caller supplies raw bytes.
+    // Validate here so single, multi-vector, and batch queries share the same guard.
+    if !(query_data as usize).is_multiple_of(alignment) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "query_data must be aligned to {alignment} bytes for element_type={element_type}"
+            )
+            .into(),
+        ));
+    }
 
     let query: arrow_array::ArrayRef = match dtype {
         LanceDataType::Float32 => {
@@ -3069,6 +3320,7 @@ unsafe fn nearest_multivector_inner(
         None,
     )?;
     s.nearest = Some(NearestQuery {
+        mode: NearestMode::MultiVector,
         column: column.to_string(),
         query: Arc::new(query),
         k,
@@ -3245,6 +3497,136 @@ mod tests {
     use lance::index::DatasetIndexExt;
     use lance::io::exec::PreFilterSource;
     use lance_index::{IndexType, scalar::InvertedIndexParams};
+
+    #[test]
+    fn batch_query_sizes_distinguish_overflow_from_byte_limit() {
+        for (dimension, num_queries, width) in [(usize::MAX, 2, 1), (usize::MAX / 2 + 1, 1, 2)] {
+            let error = batch_query_value_count(dimension, num_queries, width)
+                .unwrap_err()
+                .to_string();
+            for detail in [
+                "overflows usize".to_string(),
+                format!("dimension={dimension}"),
+                format!("num_queries={num_queries}"),
+                format!("element_width={width}"),
+            ] {
+                assert!(error.contains(&detail), "{error} lacks {detail}");
+            }
+        }
+        assert_eq!(
+            batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8, 1, 8).unwrap(),
+            MAX_BATCH_QUERY_BYTES / 8
+        );
+        let error = batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8 + 1, 1, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds limit"), "{error}");
+        assert!(!error.contains("overflows"), "{error}");
+    }
+
+    #[test]
+    fn query_decoder_rejects_unaligned_typed_buffers() {
+        let storage = [0u64; 4];
+        let unaligned = unsafe { storage.as_ptr().cast::<u8>().add(1) }.cast();
+        for element_type in [0, 1, 2] {
+            let error = unsafe { decode_query_values(unaligned, 2, element_type) }
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("query_data must be aligned"), "{error}");
+        }
+    }
+
+    #[test]
+    fn batch_matrix_does_not_enter_multivector_scoring() {
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+        use futures::TryStreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().join("batch.lance");
+        let element = Arc::new(Field::new("item", DataType::Float32, false));
+        let vectors = FixedSizeListArray::try_new(
+            element.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![0., 0., 1., 0., 4., 0., 5., 0.])),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("embedding", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        block_on(Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri.to_str().unwrap(),
+            None,
+        ))
+        .unwrap();
+        let (dataset, scanner) = open_dataset_and_scanner(uri.to_str().unwrap());
+        unsafe {
+            (*scanner).nearest = Some(NearestQuery {
+                mode: NearestMode::Batch { num_queries: 2 },
+                column: "embedding".to_string(),
+                query: Arc::new(
+                    FixedSizeListArray::try_new(
+                        element,
+                        2,
+                        Arc::new(Float32Array::from(vec![0., 0., 4., 0.])),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+            });
+            (*scanner).use_index = Some(false);
+            let result = block_on(async {
+                (*scanner)
+                    .build_scanner()?
+                    .try_into_stream()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await
+            });
+            lance_scanner_close(scanner);
+            lance_dataset_close(dataset);
+            let batches =
+                result.expect("independent batch queries must not use multivector scoring");
+            let mut rows = Vec::new();
+            for batch in batches {
+                let queries = batch
+                    .column_by_name("query_index")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let distances = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((queries.value(row), ids.value(row), distances.value(row)));
+                }
+            }
+            rows.sort_by_key(|row| (row.0, row.1));
+            assert_eq!(rows, vec![(0, 0, 0.), (0, 1, 1.), (1, 2, 0.), (1, 3, 1.)]);
+        }
+    }
 
     /// Write a 3-row dataset to a tempdir, returning (tempdir, uri).
     fn create_test_dataset() -> (tempfile::TempDir, String) {

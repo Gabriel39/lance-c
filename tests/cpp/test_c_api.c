@@ -1391,6 +1391,72 @@ static void test_distance_range(const char *uri) {
     printf("OK\n");
 }
 
+static void check_batch_nearest_results(struct ArrowArrayStream *stream) {
+    struct ArrowSchema schema = {0};
+    ASSERT(stream->get_schema(stream, &schema) == 0, "batch nearest result");
+    int query_column = -1, id_column = -1, distance_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "query_index") == 0) {
+            query_column = (int)i;
+        }
+        if (strcmp(schema.children[i]->name, "id") == 0) id_column = (int)i;
+        if (strcmp(schema.children[i]->name, "_distance") == 0) distance_column = (int)i;
+    }
+    ASSERT(query_column >= 0, "batch nearest result");
+    ASSERT(strcmp(schema.children[query_column]->format, "i") == 0, "batch nearest result");
+    ASSERT(id_column >= 0 && distance_column >= 0, "missing result columns");
+    schema.release(&schema);
+    int counts[2] = {0, 0};
+    int seen[2] = {0, 0};
+    while (1) {
+        struct ArrowArray batch = {0};
+        ASSERT(stream->get_next(stream, &batch) == 0, "batch nearest result");
+        if (!batch.release) break;
+        struct ArrowArray *queries = batch.children[query_column];
+        const int32_t *values = (const int32_t *)queries->buffers[1];
+        struct ArrowArray *ids = batch.children[id_column];
+        struct ArrowArray *distances = batch.children[distance_column];
+        const int32_t *id_values = (const int32_t *)ids->buffers[1];
+        const float *distance_values = (const float *)distances->buffers[1];
+        for (int64_t i = 0; i < batch.length; ++i) {
+            int32_t index = values[queries->offset + i];
+            ASSERT(index >= 0 && index < 2, "batch nearest result");
+            int32_t id = id_values[ids->offset + i];
+            int32_t first_id = index == 0 ? 1 : 19;
+            ASSERT(id >= first_id && id <= first_id + 1, "wrong per-query neighbor");
+            seen[index] |= 1 << (id - first_id);
+            float expected = (id == 1 || id == 20) ? 0.0f : 0.08f;
+            float error = distance_values[distances->offset + i] - expected;
+            ASSERT(error > -0.0001f && error < 0.0001f, "wrong per-query distance");
+            ++counts[index];
+        }
+        batch.release(&batch);
+    }
+    ASSERT(counts[0] == 2 && counts[1] == 2, "batch nearest result");
+    ASSERT(seen[0] == 3 && seen[1] == 3, "missing per-query neighbor");
+    stream->release(stream);
+}
+
+static void test_batch_nearest(const char *uri) {
+    float queries[16];
+    for (int i = 0; i < 8; ++i) {
+        queries[i] = 0.1f + i;
+        queries[8 + i] = 2.0f + i;
+    }
+    LanceDataset *dataset = lance_dataset_open(uri, NULL, 0);
+    ASSERT(dataset != NULL, "open batch dataset");
+    LanceScanner *scanner = lance_scanner_new(dataset, NULL, NULL);
+    ASSERT(scanner != NULL, "open batch scanner");
+    ASSERT(lance_scanner_nearest_batch(scanner, "embedding", queries, 8, 2, LANCE_DTYPE_FLOAT32, 2) == 0, "batch nearest");
+    ASSERT(lance_scanner_set_use_index(scanner, false) == 0, "flat batch search");
+    ASSERT(lance_scanner_set_batch_size(scanner, 1) == 0, "small output batches");
+    struct ArrowArrayStream stream = {0};
+    ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0, "export batch stream");
+    lance_scanner_close(scanner);
+    lance_dataset_close(dataset);
+    check_batch_nearest_results(&stream);
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
@@ -1402,6 +1468,7 @@ int main(int argc, char **argv) {
     const char *blob_uri = argv[3];
     printf("Running C API tests with dataset: %s\n", uri);
 
+    test_batch_nearest(uri);
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_scan(uri);

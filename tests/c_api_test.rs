@@ -17276,3 +17276,28 @@ fn test_blob_close_keeps_the_pending_error_readable() {
     close_blob_handles(&rest);
     unsafe { lance_dataset_close(ds) };
 }
+
+#[test]
+fn test_scanner_nearest_batch_null_arguments() {
+    let (_dir, uri) = create_vector_dataset(8, 2);
+    unsafe {
+        let ds = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+        let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+        let query = [0f32, 1.];
+        for (scanner, column, data) in [
+            (ptr::null_mut(), c_str("embedding"), query.as_ptr().cast()),
+            (scan, c_str("embedding"), ptr::null()),
+        ] {
+            assert_ne!(
+                lance_scanner_nearest_batch(scanner, column.as_ptr(), data, 2, 1, 0, 1),
+                0
+            );
+        }
+        assert_ne!(
+            lance_scanner_nearest_batch(scan, ptr::null(), query.as_ptr().cast(), 2, 1, 0, 1),
+            0
+        );
+        lance_scanner_close(scan);
+        lance_dataset_close(ds);
+    }
+}

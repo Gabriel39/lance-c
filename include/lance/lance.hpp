@@ -1636,6 +1636,22 @@ public:
         return *this;
     }
 
+    /// Independent queries; each returns up to k rows tagged with query_index.
+    Scanner& nearest_batch(const std::string& column, const void* query_data,
+                           size_t dimension, size_t num_queries,
+                           LanceDataType element_type, uint32_t k) {
+        if (lance_scanner_nearest_batch(handle_.get(), column.c_str(), query_data,
+                                       dimension, num_queries, element_type, k) != 0)
+            check_error();
+        return *this;
+    }
+
+    /// Float32 batch convenience overload; input values are copied before returning.
+    Scanner& nearest_batch(const std::string& column, const float* query_data,
+                           size_t dimension, size_t num_queries, uint32_t k) {
+        return nearest_batch(column, query_data, dimension, num_queries, LANCE_DTYPE_FLOAT32, k);
+    }
+
     /// One multi-vector query, copied from dimension * num_vectors row-major elements.
     Scanner& nearest_multivector(const std::string& column, const void* query_data,
                                 size_t dimension, size_t num_vectors,
