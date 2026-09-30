@@ -1198,6 +1198,42 @@ static void test_delete_rows(const std::string& dst_uri) {
     PASS();
 }
 
+static void test_distance_range(const std::string& uri) {
+    TEST(test_distance_range);
+    auto ds = lance::Dataset::open(uri);
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.1f + static_cast<float>(i);
+    const int64_t expected[] = {2, 1, 20};
+    for (int mode = 0; mode < 3; ++mode) {
+        auto scanner = ds.scan();
+        scanner.nearest("embedding", query, 8, 20).use_index(false);
+        if (mode == 1) scanner.distance_range(0.02f, 0.125f);
+        else scanner.distance_range(std::nullopt, 0.125f);
+        if (mode == 2) scanner.distance_range();
+        bool rejected = false;
+        try {
+            scanner.distance_range(1.0f, 0.0f);
+        } catch (const lance::Error& e) {
+            rejected = true;
+            assert(e.code == LANCE_ERR_INVALID_ARGUMENT);
+        }
+        assert(rejected);
+        ArrowArrayStream stream{};
+        scanner.to_arrow_stream(&stream);
+        int64_t rows = 0;
+        while (true) {
+            ArrowArray array{};
+            assert(stream.get_next(&stream, &array) == 0);
+            if (!array.release) break;
+            rows += array.length;
+            array.release(&array);
+        }
+        assert(rows == expected[mode]);
+        stream.release(&stream);
+    }
+    PASS();
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
@@ -1213,6 +1249,7 @@ int main(int argc, char** argv) {
     test_shared_session(uri);
     test_dataset_schema(uri);
     test_scanner_fluent(uri);
+    test_distance_range(uri);
     test_scanner_async_stream_ownership(uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);

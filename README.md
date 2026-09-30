@@ -69,6 +69,46 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
 
+## Distance-bounded vector search
+
+After configuring a single-vector nearest-neighbor query, use
+`lance_scanner_set_distance_range` or C++ `Scanner::distance_range` to restrict
+results to `lower_bound <= _distance < upper_bound`:
+
+```cpp
+const float query[] = {1.0f, 0.0f};
+auto scanner = dataset.scan();
+scanner.nearest("embedding", query, 2, 100)
+       .metric(LANCE_METRIC_L2)
+       .distance_range(std::nullopt, 0.5f);
+```
+
+This returns **at most 100** neighbors with distance below `0.5`. It is a
+range-constrained Top-K search, not an unbounded enumeration of all matches.
+For an annulus, use `.distance_range(0.2f, 0.5f)`; for a lower bound only, use
+`.distance_range(0.2f)`; `.distance_range()` clears both bounds. In C, pass
+pointers to bounds and `NULL` for an unbounded side:
+
+```c
+float upper_bound = 0.5f;
+int32_t status = lance_scanner_set_distance_range(scanner, NULL, &upper_bound);
+/* Check status and lance_last_error_* before starting the scan. */
+```
+
+Bounds are copied and must be finite. When both are set, the lower bound must
+be strictly smaller than the upper bound. Negative bounds are allowed (for
+example, Dot distances can be negative). Distances use the selected metric's
+units: L2 reports **squared Euclidean distance**, so a geometric radius `r`
+corresponds to an upper bound of `r * r`, with the boundary excluded. Index-based
+search retains Lance's approximate candidate selection; the range does not
+guarantee exhaustive recall. Use `.use_index(false)` for an exact scan, still
+subject to `k`.
+
+Set bounds after `nearest` and before starting the scan. Replacing the nearest
+query clears the bounds; an invalid range leaves the previous range unchanged.
+Multi-vector queries are not supported by this setter because their scores
+aggregate distances across subvectors.
+
 ## Multi-vector search
 
 Use `lance_scanner_nearest_multivector` or the C++ `Scanner::nearest_multivector`

@@ -7306,6 +7306,274 @@ fn test_create_index_replace_false_conflicts() {
 // Vector search (k-NN) tests (Phase 2)
 // ---------------------------------------------------------------------------
 
+fn range_scanner(dataset: *const LanceDataset, k: u32) -> *mut LanceScanner {
+    let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let query: Vec<f32> = (0..8).map(|i| 31.0 + i as f32 / 8.0).collect();
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest(
+                scanner,
+                c_str("embedding").as_ptr(),
+                query.as_ptr().cast(),
+                query.len(),
+                LanceDataType::Float32 as i32,
+                k,
+            )
+        },
+        0
+    );
+    scanner
+}
+
+fn range_results(scanner: *mut LanceScanner) -> Vec<(i32, f32)> {
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    reader
+        .flat_map(|batch| {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let distances = batch
+                .column_by_name("_distance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|i| (ids.value(i), distances.value(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn test_scanner_distance_range_flat_and_indexed_boundaries() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+    let params = LanceVectorIndexParams {
+        index_type: LanceVectorIndexType::IvfFlat,
+        metric: LanceMetricType::L2,
+        num_partitions: 2,
+        num_sub_vectors: 0,
+        num_bits: 0,
+        max_iterations: 0,
+        hnsw_m: 0,
+        hnsw_ef_construction: 0,
+        sample_rate: 0,
+    };
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_vector_index(
+                dataset,
+                c_str("embedding").as_ptr(),
+                ptr::null(),
+                &params,
+                false,
+            )
+        },
+        0,
+        "{}",
+        take_last_error_message()
+    );
+    for use_index in [false, true] {
+        for (lower, upper, k, expected) in [
+            (None, Some(32.0), 64, vec![30, 31, 32]),
+            (Some(8.0), Some(72.0), 64, vec![29, 30, 32, 33]),
+            (Some(8.0), Some(72.0), 2, vec![30, 32]),
+            (Some(32.0), Some(72.0), 64, vec![29, 33]),
+            (Some(7688.0), None, 64, vec![0, 62, 63]),
+            (None, Some(0.0), 64, vec![]),
+        ] {
+            let scanner = range_scanner(dataset, k);
+            assert_eq!(
+                unsafe { lance_scanner_set_use_index(scanner, use_index) },
+                0
+            );
+            assert_eq!(unsafe { lance_scanner_set_nprobes(scanner, 2) }, 0);
+            assert_eq!(
+                unsafe {
+                    lance_scanner_set_distance_range(
+                        scanner,
+                        lower.as_ref().map_or(ptr::null(), |v| v),
+                        upper.as_ref().map_or(ptr::null(), |v| v),
+                    )
+                },
+                0
+            );
+            let result = range_results(scanner);
+            assert!(result.windows(2).all(|w| w[0].1 <= w[1].1));
+            assert!(
+                result
+                    .iter()
+                    .all(|(_, d)| lower.is_none_or(|l| *d >= l) && upper.is_none_or(|u| *d < u))
+            );
+            let mut ids: Vec<_> = result.into_iter().map(|(id, _)| id).collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "use_index={use_index}, lower={lower:?}, upper={upper:?}, k={k}"
+            );
+            unsafe { lance_scanner_close(scanner) };
+        }
+    }
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_scanner_distance_range_validation_is_atomic_and_copies_bounds() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    assert_eq!(
+        unsafe { lance_scanner_set_distance_range(ptr::null_mut(), ptr::null(), ptr::null()) },
+        -1
+    );
+    let plain = unsafe { lance_scanner_new(dataset, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_distance_range(plain, ptr::null(), &32.0) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe { lance_scanner_close(plain) };
+    let scanner = range_scanner(dataset, 64);
+    let mut upper = 32.0;
+    assert_eq!(
+        unsafe { lance_scanner_set_distance_range(scanner, ptr::null(), &upper) },
+        0
+    );
+    upper = 0.0;
+    assert_eq!(upper, 0.0);
+    for (lower, upper) in [
+        (f32::NAN, 32.0),
+        (0.0, f32::NAN),
+        (f32::NEG_INFINITY, 32.0),
+        (0.0, f32::INFINITY),
+        (32.0, 8.0),
+        (32.0, 32.0),
+    ] {
+        assert_eq!(
+            unsafe { lance_scanner_set_distance_range(scanner, &lower, &upper) },
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    }
+    let mut ids: Vec<_> = range_results(scanner)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![30, 31, 32]);
+    assert_eq!(
+        unsafe { lance_scanner_set_distance_range(scanner, ptr::null(), ptr::null()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    unsafe {
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_scanner_distance_range_can_clear_and_nearest_replacement_resets_bounds() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    let dataset = unsafe { lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0) };
+    for replace_nearest in [false, true] {
+        let scanner = range_scanner(dataset, 5);
+        assert_eq!(
+            unsafe { lance_scanner_set_distance_range(scanner, ptr::null(), &0.0) },
+            0
+        );
+        if replace_nearest {
+            let query = [0.0f32; 8];
+            assert_eq!(
+                unsafe {
+                    lance_scanner_nearest(
+                        scanner,
+                        c_str("embedding").as_ptr(),
+                        query.as_ptr().cast(),
+                        8,
+                        LanceDataType::Float32 as i32,
+                        5,
+                    )
+                },
+                0
+            );
+        } else {
+            assert_eq!(
+                unsafe { lance_scanner_set_distance_range(scanner, ptr::null(), ptr::null()) },
+                0
+            );
+        }
+        assert_eq!(range_results(scanner).len(), 5);
+        unsafe { lance_scanner_close(scanner) };
+    }
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_scanner_distance_range_combines_with_prefilter_and_result_window() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    unsafe {
+        let dataset = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+        let scanner = range_scanner(dataset, 64);
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        assert_eq!(lance_scanner_set_prefilter(scanner, true), 0);
+        assert_eq!(
+            lance_scanner_additional_sql_filter(scanner, c_str("id >= 31").as_ptr()),
+            0
+        );
+        assert_eq!(lance_scanner_set_distance_range(scanner, &8.0, &72.0), 0);
+        assert_eq!(lance_scanner_set_offset(scanner, 1), 0);
+        assert_eq!(lance_scanner_set_limit(scanner, 1), 0);
+        assert_eq!(range_results(scanner), vec![(33, 32.0)]);
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
+    }
+}
+
+#[test]
+fn test_scanner_distance_range_accepts_negative_dot_distances() {
+    let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 32, 8, false);
+    unsafe {
+        let dataset = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+        let scanner = lance_scanner_new(dataset, ptr::null(), ptr::null());
+        let query = [1.0f32; 8];
+        assert_eq!(
+            lance_scanner_nearest(
+                scanner,
+                c_str("embedding").as_ptr(),
+                query.as_ptr().cast(),
+                8,
+                LanceDataType::Float32 as i32,
+                64
+            ),
+            0
+        );
+        assert_eq!(
+            lance_scanner_set_metric(scanner, LanceMetricType::Dot as i32),
+            0
+        );
+        assert_eq!(lance_scanner_set_use_index(scanner, false), 0);
+        // Dot distance is 1 - dot(query, row), which can be negative.
+        assert_eq!(lance_scanner_set_distance_range(scanner, &-18.5, &-2.5), 0);
+        assert_eq!(range_results(scanner), vec![(2, -18.5), (1, -10.5)]);
+        lance_scanner_close(scanner);
+        lance_dataset_close(dataset);
+    }
+}
+
 #[test]
 fn test_scanner_nearest_brute_force() {
     let (_tmp, uri) = create_vector_dataset(64, 8);

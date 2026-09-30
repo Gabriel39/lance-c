@@ -1310,6 +1310,44 @@ static void test_delete(const char *write_uri) {
     printf("deleted=%llu... OK\n", (unsigned long long)deleted);
 }
 
+static void test_distance_range(const char *uri) {
+    printf("  test_distance_range... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.1f + (float)i;
+    const float lower = 0.02f, upper = 0.125f;
+    const int64_t expected[] = {2, 1, 20};
+    for (int mode = 0; mode < 3; ++mode) {
+        LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+        ASSERT(scanner != NULL, "create scanner failed");
+        ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                    LANCE_DTYPE_FLOAT32, 20) == 0, "nearest failed");
+        ASSERT(lance_scanner_set_use_index(scanner, false) == 0, "use_index failed");
+        ASSERT(lance_scanner_set_distance_range(scanner, mode == 1 ? &lower : NULL,
+                                               &upper) == 0, "distance_range failed");
+        if (mode == 2) {
+            ASSERT(lance_scanner_set_distance_range(scanner, NULL, NULL) == 0,
+                   "clearing distance_range failed");
+        }
+        struct ArrowArrayStream stream = {0};
+        ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0, "stream failed");
+        int64_t rows = 0;
+        while (1) {
+            struct ArrowArray array = {0};
+            ASSERT(stream.get_next(&stream, &array) == 0, "get_next failed");
+            if (!array.release) break;
+            rows += array.length;
+            array.release(&array);
+        }
+        ASSERT(rows == expected[mode], "distance_range row count mismatch");
+        stream.release(&stream);
+        lance_scanner_close(scanner);
+    }
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
@@ -1324,6 +1362,7 @@ int main(int argc, char **argv) {
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_scan(uri);
+    test_distance_range(uri);
     test_scan_with_limit(uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);

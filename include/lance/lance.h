@@ -2126,6 +2126,31 @@ int32_t lance_scanner_nearest(
 );
 
 /**
+ * Restrict a single-vector nearest query to lower_bound <= _distance < upper_bound.
+ *
+ * Call after lance_scanner_nearest and before starting the scan. Both bounds
+ * are copied before returning; NULL means unbounded on that side. Passing NULL
+ * for both clears the range. A successful replacement nearest query also clears
+ * the range. Multi-vector queries and scans without nearest are rejected.
+ *
+ * Bounds must be finite; negative distances are allowed. When both are present,
+ * lower_bound must be strictly smaller than upper_bound. Invalid calls leave the
+ * previous range unchanged. Distances use the configured metric's units (L2 is
+ * squared Euclidean distance). Results still have the nearest query's k cap;
+ * index-based search remains approximate, not an exhaustive range enumeration.
+ *
+ * @param scanner      Scanner with a single-vector nearest query.
+ * @param lower_bound  Inclusive lower bound, or NULL.
+ * @param upper_bound  Exclusive upper bound, or NULL.
+ * @return 0 on success, -1 on error (check lance_last_error_*).
+ */
+int32_t lance_scanner_set_distance_range(
+    LanceScanner* scanner,
+    const float* lower_bound,
+    const float* upper_bound
+);
+
+/**
  * Set one multi-vector query on a List<FixedSizeList<float16|float32|float64>> column.
  * Inner vectors must be non-nullable and contain no null elements; the outer list may be nullable.
  * query_data contains dimension * num_vectors aligned elements in row-major order.
