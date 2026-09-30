@@ -963,3 +963,32 @@ fn strict_batches_apply_after_multivector_offset_and_limit() {
         lance_dataset_close(ds);
     }
 }
+
+#[test]
+fn multivector_distance_range_is_rejected_instead_of_filtering_subvectors() {
+    let (_dir, uri) = fixture();
+    unsafe {
+        let ds = lance_dataset_open(uri.as_ptr(), ptr::null(), 0);
+        let scan = lance_scanner_new(ds, ptr::null(), ptr::null());
+        let query = [1.0f32, 0.0];
+        assert_eq!(
+            lance_scanner_nearest_multivector(
+                scan,
+                CString::new("vectors").unwrap().as_ptr(),
+                query.as_ptr().cast(),
+                2,
+                1,
+                LanceDataType::Float32 as i32,
+                3
+            ),
+            0
+        );
+        assert_eq!(
+            lance_scanner_set_distance_range(scan, ptr::null(), &1.0),
+            -1
+        );
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+        lance_scanner_close(scan);
+        lance_dataset_close(ds);
+    }
+}

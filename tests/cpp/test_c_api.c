@@ -1310,6 +1310,87 @@ static void test_delete(const char *write_uri) {
     printf("deleted=%llu... OK\n", (unsigned long long)deleted);
 }
 
+static void check_distance_range_results(struct ArrowArrayStream *stream,
+                                         const float *lower, const float *upper,
+                                         uint32_t expected_ids, int64_t expected_count) {
+    struct ArrowSchema schema = {0};
+    ASSERT(stream->get_schema(stream, &schema) == 0, "get_schema failed");
+    int id_column = -1, distance_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "id") == 0) id_column = (int)i;
+        if (strcmp(schema.children[i]->name, "_distance") == 0) distance_column = (int)i;
+    }
+    ASSERT(id_column >= 0 && distance_column >= 0, "missing range result columns");
+    ASSERT(strcmp(schema.children[id_column]->format, "i") == 0 &&
+           strcmp(schema.children[distance_column]->format, "f") == 0, "unexpected range result types");
+    schema.release(&schema);
+    int64_t rows = 0;
+    uint32_t seen = 0;
+    while (1) {
+        struct ArrowArray array = {0};
+        ASSERT(stream->get_next(stream, &array) == 0, "get_next failed");
+        if (!array.release) break;
+        const struct ArrowArray *ids = array.children[id_column];
+        const struct ArrowArray *distances = array.children[distance_column];
+        const int32_t *id_values = (const int32_t *)ids->buffers[1];
+        const float *distance_values = (const float *)distances->buffers[1];
+        for (int64_t i = 0; i < array.length; ++i) {
+            int32_t id = id_values[ids->offset + i];
+            float distance = distance_values[distances->offset + i];
+            ASSERT(id >= 1 && id <= 20, "unexpected range result id");
+            uint32_t bit = 1u << (id - 1);
+            ASSERT((seen & bit) == 0, "duplicate range result id");
+            seen |= bit;
+            ASSERT(distance >= 0.0f && (!lower || distance >= *lower) && (!upper || distance < *upper), "distance outside half-open range");
+        }
+        rows += array.length;
+        array.release(&array);
+    }
+    ASSERT(rows == expected_count && seen == expected_ids, "range result ids/count mismatch");
+    stream->release(stream);
+}
+
+static void test_distance_range(const char *uri) {
+    printf("  test_distance_range... ");
+    LanceDataset *ds = lance_dataset_open(uri, NULL, 0);
+    ASSERT(ds != NULL, "open failed");
+    float query[8];
+    for (int i = 0; i < 8; ++i) query[i] = 0.1f + (float)i;
+    const float positive_lower = 0.02f, positive_upper = 0.125f, zero = 0.0f;
+    const int64_t expected[] = {2, 1, 20, 20, 0};
+    const uint32_t expected_ids[] = {3u, 2u, (1u << 20) - 1, (1u << 20) - 1, 0u};
+    for (int mode = 0; mode < 5; ++mode) {
+        LanceScanner *scanner = lance_scanner_new(ds, NULL, NULL);
+        ASSERT(scanner != NULL, "create scanner failed");
+        ASSERT(lance_scanner_nearest(scanner, "embedding", query, 8,
+                                    LANCE_DTYPE_FLOAT32, 20) == 0, "nearest failed");
+        ASSERT(lance_scanner_set_use_index(scanner, false) == 0, "use_index failed");
+        const float *lower = mode == 1 ? &positive_lower : NULL;
+        const float *upper = &positive_upper;
+        /* Row 1 lies on zero: distinguish inclusive lower and exclusive upper bounds. */
+        if (mode == 3) { lower = &zero; upper = NULL; }
+        if (mode == 4) upper = &zero;
+        ASSERT(lance_scanner_set_distance_range(scanner, lower, upper) == 0,
+               "distance_range failed");
+        if (mode == 2) {
+            ASSERT(lance_scanner_set_distance_range(scanner, NULL, NULL) == 0,
+                   "clearing distance_range failed");
+            lower = NULL;
+            upper = NULL;
+        }
+        ASSERT(lance_scanner_set_distance_range(scanner, &positive_upper, &positive_lower) == -1,
+               "reversed distance range must fail");
+        ASSERT(lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+               "expected INVALID_ARGUMENT");
+        struct ArrowArrayStream stream = {0};
+        ASSERT(lance_scanner_to_arrow_stream(scanner, &stream) == 0, "stream failed");
+        check_distance_range_results(&stream, lower, upper, expected_ids[mode], expected[mode]);
+        lance_scanner_close(scanner);
+    }
+    lance_dataset_close(ds);
+    printf("OK\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <dataset_uri> <write_uri> <blob_uri>\n", argv[0]);
@@ -1324,6 +1405,7 @@ int main(int argc, char **argv) {
     test_open_and_metadata(uri);
     test_shared_session(uri);
     test_scan(uri);
+    test_distance_range(uri);
     test_scan_with_limit(uri);
     test_scanner_blob_handling(blob_uri);
     test_take_blobs(blob_uri);

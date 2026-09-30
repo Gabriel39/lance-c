@@ -148,6 +148,8 @@ struct NearestQuery {
     column: String,
     query: arrow_array::ArrayRef,
     k: u32,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
 }
 
 /// The effective adaptive partition-search range shared by all three nprobes
@@ -444,6 +446,7 @@ impl LanceScanner {
         }
         if let Some(n) = &self.nearest {
             scanner.nearest(&n.column, n.query.as_ref(), n.k as usize)?;
+            scanner.distance_range(n.lower_bound, n.upper_bound);
             if let Some(minimum_nprobes) = self.nprobes.minimum {
                 scanner.minimum_nprobes(minimum_nprobes as usize);
             }
@@ -2502,6 +2505,68 @@ macro_rules! scanner_set_u32 {
 scanner_set_u32!(lance_scanner_set_refine_factor, refine_factor);
 scanner_set_u32!(lance_scanner_set_ef, ef);
 
+/// Set inclusive lower and exclusive upper distance bounds on a single-vector query.
+///
+/// NULL bounds are unbounded. Values are copied and must be finite, with lower < upper
+/// when both are present. Call after nearest and before scanning; k still caps results.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lance_scanner_set_distance_range(
+    scanner: *mut LanceScanner,
+    lower_bound: *const f32,
+    upper_bound: *const f32,
+) -> i32 {
+    scanner_poison_check!(scanner, -1);
+    scanner_ffi_try!(scanner, unsafe {
+        scanner_set_distance_range_inner(scanner, lower_bound, upper_bound)
+    })
+}
+
+unsafe fn scanner_set_distance_range_inner(
+    scanner: *mut LanceScanner,
+    lower_bound: *const f32,
+    upper_bound: *const f32,
+) -> Result<i32> {
+    let invalid = |message: String| lance_core::Error::invalid_input_source(message.into());
+    if scanner.is_null() {
+        return Err(invalid("scanner is NULL".into()));
+    }
+    let scanner = unsafe { &mut *scanner };
+    scanner.ensure_scan_not_started("distance_range")?;
+    let nearest = scanner
+        .nearest
+        .as_mut()
+        .ok_or_else(|| invalid("distance_range requires nearest() to be configured".into()))?;
+    // Multi-vector scores aggregate subvectors; filtering each subvector's
+    // candidates would not enforce the requested range on the final score.
+    if matches!(
+        nearest.query.data_type(),
+        arrow_schema::DataType::FixedSizeList(_, _)
+    ) {
+        return Err(invalid(
+            "distance_range does not support multi-vector queries".into(),
+        ));
+    }
+    let lower_bound = unsafe { lower_bound.as_ref() }.copied();
+    let upper_bound = unsafe { upper_bound.as_ref() }.copied();
+    for (name, bound) in [("lower_bound", lower_bound), ("upper_bound", upper_bound)] {
+        if let Some(value) = bound
+            && !value.is_finite()
+        {
+            return Err(invalid(format!("{name} must be finite, got {value}")));
+        }
+    }
+    if let (Some(lower), Some(upper)) = (lower_bound, upper_bound)
+        && lower >= upper
+    {
+        return Err(invalid(format!(
+            "lower_bound ({lower}) must be less than upper_bound ({upper})"
+        )));
+    }
+    nearest.lower_bound = lower_bound;
+    nearest.upper_bound = upper_bound;
+    Ok(0)
+}
+
 /// Set both vector-index partition-search bounds to the same value.
 ///
 /// This replaces any values previously configured through
@@ -2851,6 +2916,8 @@ unsafe fn scanner_nearest_inner(
         column: column_str.to_string(),
         query,
         k,
+        lower_bound: None,
+        upper_bound: None,
     });
     Ok(0)
 }
@@ -3005,6 +3072,8 @@ unsafe fn nearest_multivector_inner(
         column: column.to_string(),
         query: Arc::new(query),
         k,
+        lower_bound: None,
+        upper_bound: None,
     });
     Ok(0)
 }

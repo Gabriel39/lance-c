@@ -1622,6 +1622,20 @@ public:
         return *this;
     }
 
+    /// Restrict single-vector nearest results to [lower_bound, upper_bound).
+    /// Call after nearest() and before scanning. Omitted bounds are unbounded;
+    /// distance_range() clears both. Bounds must be finite and lower < upper
+    /// when both are present. Uses metric distance units (squared L2 for L2).
+    /// The nearest query's k cap and ANN candidate selection still apply.
+    Scanner& distance_range(std::optional<float> lower_bound = std::nullopt,
+                            std::optional<float> upper_bound = std::nullopt) {
+        if (lance_scanner_set_distance_range(handle_.get(),
+                                            lower_bound ? &*lower_bound : nullptr,
+                                            upper_bound ? &*upper_bound : nullptr) != 0)
+            check_error();
+        return *this;
+    }
+
     /// One multi-vector query, copied from dimension * num_vectors row-major elements.
     Scanner& nearest_multivector(const std::string& column, const void* query_data,
                                 size_t dimension, size_t num_vectors,
