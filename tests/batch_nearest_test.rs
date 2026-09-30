@@ -240,6 +240,131 @@ fn batch_nearest_indexed_shared_and_refined_fallback() {
 }
 
 #[test]
+fn batch_nearest_respects_selected_index_segments() {
+    use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
+    use lance_index::IndexType;
+    use lance_linalg::distance::MetricType;
+    let (_dir, uri) = fixture();
+    let segments = lance_c::runtime::block_on(async {
+        let mut ds = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        let mut segments = Vec::new();
+        for fragment in 0..2 {
+            segments.push(
+                ds.create_index_builder(&["embedding"], IndexType::Vector, &params)
+                    .name("embedding_idx".into())
+                    .fragments(vec![fragment])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let uuids = segments
+            .iter()
+            .map(|s| *s.uuid.as_bytes())
+            .collect::<Vec<_>>();
+        ds.commit_existing_index_segments("embedding_idx", "embedding", segments)
+            .await
+            .unwrap();
+        uuids
+    });
+    let data = Data::open(&uri);
+    let queries = [2.25, 1., 100.25, 1.];
+    for (selected, domain) in [(vec![0], 0..64), (vec![1], 64..128), (vec![0, 1], 0..128)] {
+        let scan = data.scan();
+        configure(&scan, &queries, 3);
+        let uuids = selected
+            .iter()
+            .flat_map(|i| segments[*i])
+            .collect::<Vec<_>>();
+        ok(unsafe { lance_scanner_set_index_segments(scan.0, uuids.as_ptr(), selected.len()) });
+        ok(unsafe { lance_scanner_set_nprobes(scan.0, 1) });
+        let mut want = Vec::new();
+        for (index, q) in queries.as_chunks::<2>().0.iter().enumerate() {
+            let mut rows = domain
+                .clone()
+                .map(|id| {
+                    (
+                        index as i32,
+                        id,
+                        (id as f32 - q[0]).powi(2) + (1. - q[1]).powi(2),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.1.cmp(&b.1)));
+            want.extend(rows.into_iter().take(3));
+        }
+        assert_eq!(read(&scan), want, "selected segments: {selected:?}");
+    }
+}
+
+#[test]
+fn batch_nearest_size_error_identifies_the_request() {
+    let (_dir, uri) = fixture();
+    let data = Data::open(&uri);
+    let scan = data.scan();
+    let q = [2.25f32, 1., 100.25, 1.];
+    configure(&scan, &q, 2);
+    // Rejection must happen before reading the oversized input buffer.
+    assert_eq!(
+        unsafe {
+            lance_scanner_nearest_batch(
+                scan.0,
+                c("embedding").as_ptr(),
+                q.as_ptr().cast(),
+                10_000_000,
+                2,
+                0,
+                2,
+            )
+        },
+        -1
+    );
+    let message = unsafe {
+        let ptr = lance_last_error_message();
+        let message = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        lance_free_string(ptr);
+        message
+    };
+    for detail in [
+        "dimension=10000000",
+        "num_queries=2",
+        "element_width=4",
+        "80000000",
+        "67108864",
+    ] {
+        assert!(message.contains(detail), "{message} lacks {detail}");
+    }
+    ok(unsafe { lance_scanner_set_use_index(scan.0, false) });
+    assert_eq!(read(&scan), expected(&q, 2, 0));
+}
+
+#[test]
+fn batch_nearest_int8_matches_independent_l2_queries() {
+    let values = vec![-4i8, -2, -1, 1, 3, 2, 7, 4];
+    let (_dir, uri) = typed_fixture(Arc::new(arrow_array::Int8Array::from(values)), false);
+    let data = Data::open(&uri);
+    let scan = data.scan();
+    let queries = [-3i8, -2, 6, 3];
+    ok(unsafe {
+        lance_scanner_nearest_batch(
+            scan.0,
+            c("embedding").as_ptr(),
+            queries.as_ptr().cast(),
+            2,
+            2,
+            4,
+            2,
+        )
+    });
+    ok(unsafe { lance_scanner_set_use_index(scan.0, false) });
+    assert_eq!(
+        read(&scan),
+        vec![(0, 0, 1.), (0, 1, 13.), (1, 3, 2.), (1, 2, 10.)]
+    );
+}
+
+#[test]
 fn batch_nearest_rejects_invalid_input_atomically() {
     let (_dir, uri) = fixture();
     let data = Data::open(&uri);

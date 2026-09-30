@@ -155,6 +155,25 @@ const MAX_BATCH_QUERIES: usize = 128;
 const MAX_BATCH_QUERY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_CANDIDATES: usize = 100_000;
 
+fn batch_query_value_count(dimension: usize, num_queries: usize, width: usize) -> Result<usize> {
+    // Check both products before constructing an FFI slice, including on 32-bit targets.
+    let overflow = || {
+        let message = format!(
+            "batch query byte size overflows usize: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        lance_core::Error::invalid_input_source(message.into())
+    };
+    let count = dimension.checked_mul(num_queries).ok_or_else(overflow)?;
+    let bytes = count.checked_mul(width).ok_or_else(overflow)?;
+    if bytes > MAX_BATCH_QUERY_BYTES {
+        let message = format!(
+            "batch query byte size {bytes} exceeds limit {MAX_BATCH_QUERY_BYTES}: dimension={dimension}, num_queries={num_queries}, element_width={width}"
+        );
+        return Err(lance_core::Error::invalid_input_source(message.into()));
+    }
+    Ok(count)
+}
+
 fn validate_batch_candidates(num_queries: usize, k: u32, refine_factor: Option<u32>) -> Result<()> {
     let refine = refine_factor.unwrap_or(1) as usize;
     if refine == 0
@@ -3064,29 +3083,14 @@ unsafe fn nearest_batch_inner(
         1 => (DataType::Float16, 2),
         2 => (DataType::Float64, 8),
         3 => (DataType::UInt8, 1),
+        4 => (DataType::Int8, 1),
         _ => {
             return Err(invalid(format!(
-                "batch element_type ({element_type}) must be float16, float32, float64, or uint8"
+                "batch element_type ({element_type}) must be float16, float32, float64, uint8, or int8"
             )));
         }
     };
-    let count = dimension
-        .checked_mul(num_queries)
-        .filter(|count| {
-            count
-                .checked_mul(width)
-                .is_some_and(|bytes| bytes <= MAX_BATCH_QUERY_BYTES)
-        })
-        .ok_or_else(|| {
-            invalid(format!(
-                "batch query values exceed {MAX_BATCH_QUERY_BYTES} bytes"
-            ))
-        })?;
-    if !(query_data as usize).is_multiple_of(width) {
-        return Err(invalid(format!(
-            "query_data must be aligned to {width} bytes"
-        )));
-    }
+    let count = batch_query_value_count(dimension, num_queries, width)?;
     let column = unsafe { helpers::parse_c_string(column)? }.unwrap();
     if s.dataset.schema().field("query_index").is_some() {
         return Err(invalid(
@@ -3127,8 +3131,13 @@ unsafe fn nearest_batch_inner(
             .unwrap()
             .iter()
             .all(|v| v.is_some_and(f64::is_finite)),
-        DataType::UInt8 => true,
-        _ => unreachable!(),
+        DataType::UInt8 | DataType::Int8 => true,
+        actual => {
+            // A future decoder type must return an input error instead of poisoning the scanner.
+            return Err(invalid(format!(
+                "unsupported batch query data type {actual} for element_type={element_type}"
+            )));
+        }
     };
     if !finite {
         return Err(invalid(
@@ -3158,18 +3167,29 @@ unsafe fn decode_query_values(
     query_len: usize,
     element_type: i32,
 ) -> Result<arrow_array::ArrayRef> {
-    let dtype = match element_type {
-        0 => LanceDataType::Float32,
-        1 => LanceDataType::Float16,
-        2 => LanceDataType::Float64,
-        3 => LanceDataType::UInt8,
-        4 => LanceDataType::Int8,
+    let (dtype, alignment) = match element_type {
+        0 => (LanceDataType::Float32, std::mem::align_of::<f32>()),
+        1 => (LanceDataType::Float16, std::mem::align_of::<half::f16>()),
+        2 => (LanceDataType::Float64, std::mem::align_of::<f64>()),
+        3 => (LanceDataType::UInt8, std::mem::align_of::<u8>()),
+        4 => (LanceDataType::Int8, std::mem::align_of::<i8>()),
         _ => {
             return Err(lance_core::Error::invalid_input_source(
                 format!("invalid element_type: {}", element_type).into(),
             ));
         }
     };
+
+    // from_raw_parts requires alignment even when the caller supplies raw bytes.
+    // Validate here so single, multi-vector, and batch queries share the same guard.
+    if !(query_data as usize).is_multiple_of(alignment) {
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
+                "query_data must be aligned to {alignment} bytes for element_type={element_type}"
+            )
+            .into(),
+        ));
+    }
 
     let query: arrow_array::ArrayRef = match dtype {
         LanceDataType::Float32 => {
@@ -3479,6 +3499,44 @@ mod tests {
     use lance_index::{IndexType, scalar::InvertedIndexParams};
 
     #[test]
+    fn batch_query_sizes_distinguish_overflow_from_byte_limit() {
+        for (dimension, num_queries, width) in [(usize::MAX, 2, 1), (usize::MAX / 2 + 1, 1, 2)] {
+            let error = batch_query_value_count(dimension, num_queries, width)
+                .unwrap_err()
+                .to_string();
+            for detail in [
+                "overflows usize".to_string(),
+                format!("dimension={dimension}"),
+                format!("num_queries={num_queries}"),
+                format!("element_width={width}"),
+            ] {
+                assert!(error.contains(&detail), "{error} lacks {detail}");
+            }
+        }
+        assert_eq!(
+            batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8, 1, 8).unwrap(),
+            MAX_BATCH_QUERY_BYTES / 8
+        );
+        let error = batch_query_value_count(MAX_BATCH_QUERY_BYTES / 8 + 1, 1, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds limit"), "{error}");
+        assert!(!error.contains("overflows"), "{error}");
+    }
+
+    #[test]
+    fn query_decoder_rejects_unaligned_typed_buffers() {
+        let storage = [0u64; 4];
+        let unaligned = unsafe { storage.as_ptr().cast::<u8>().add(1) }.cast();
+        for element_type in [0, 1, 2] {
+            let error = unsafe { decode_query_values(unaligned, 2, element_type) }
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("query_data must be aligned"), "{error}");
+        }
+    }
+
+    #[test]
     fn batch_matrix_does_not_enter_multivector_scoring() {
         use arrow_array::{Array, FixedSizeListArray, Float32Array};
         use futures::TryStreamExt;
@@ -3541,7 +3599,7 @@ mod tests {
             lance_dataset_close(dataset);
             let batches =
                 result.expect("independent batch queries must not use multivector scoring");
-            let mut counts = [0; 2];
+            let mut rows = Vec::new();
             for batch in batches {
                 let queries = batch
                     .column_by_name("query_index")
@@ -3549,11 +3607,24 @@ mod tests {
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .unwrap();
-                for q in queries.values() {
-                    counts[*q as usize] += 1;
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let distances = batch
+                    .column_by_name("_distance")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.push((queries.value(row), ids.value(row), distances.value(row)));
                 }
             }
-            assert_eq!(counts, [2, 2]);
+            rows.sort_by_key(|row| (row.0, row.1));
+            assert_eq!(rows, vec![(0, 0, 0.), (0, 1, 1.), (1, 2, 0.), (1, 3, 1.)]);
         }
     }
 

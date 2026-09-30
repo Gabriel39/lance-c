@@ -164,7 +164,7 @@ matching rows produce no result rows. Result row order is not part of the API co
 This differs from `nearest_multivector`: that API scores one logical query
 against a `List<FixedSizeList<...>>` column and returns one ranked result set.
 Batch input requires a fixed-size vector column and rejects a dataset with a
-reserved `query_index` column. Float16, Float32, Float64, and UInt8 are accepted;
+reserved `query_index` column. Float16, Float32, Float64, Int8, and UInt8 are accepted;
 the query element type must match the column. UInt8 uses the Hamming metric.
 Floating-point query values must be finite. Values are copied before the setter
 returns, so the caller can immediately release its input buffer.

@@ -2153,7 +2153,7 @@ int32_t lance_scanner_set_distance_range(
 /**
  * Set independent k-NN queries on a FixedSizeList<element_type, dimension> column.
  * query_data contains dimension * num_queries aligned, row-major elements, copied
- * before returning. Supported element types: Float16/32/64 and UInt8 (Hamming).
+ * before returning. Supported element types: Float16/32/64, Int8, and UInt8 (Hamming).
  * Floating-point values must be finite and the type/dimension must match the column.
  *
  * Every query returns up to k rows with a zero-based int32 query_index column and
