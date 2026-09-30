@@ -7454,16 +7454,26 @@ fn test_scanner_distance_range_validation_is_atomic_and_copies_bounds() {
     );
     upper = 0.0;
     assert_eq!(upper, 0.0);
+    // Leave the other side unbounded so ordering validation cannot mask a
+    // regression in the finite-value check, especially for +inf lower/-inf upper.
     for (lower, upper) in [
-        (f32::NAN, 32.0),
-        (0.0, f32::NAN),
-        (f32::NEG_INFINITY, 32.0),
-        (0.0, f32::INFINITY),
-        (32.0, 8.0),
-        (32.0, 32.0),
+        (Some(f32::NAN), None),
+        (None, Some(f32::NAN)),
+        (Some(f32::NEG_INFINITY), None),
+        (Some(f32::INFINITY), None),
+        (None, Some(f32::NEG_INFINITY)),
+        (None, Some(f32::INFINITY)),
+        (Some(32.0), Some(8.0)),
+        (Some(32.0), Some(32.0)),
     ] {
         assert_eq!(
-            unsafe { lance_scanner_set_distance_range(scanner, &lower, &upper) },
+            unsafe {
+                lance_scanner_set_distance_range(
+                    scanner,
+                    lower.as_ref().map_or(ptr::null(), |v| v),
+                    upper.as_ref().map_or(ptr::null(), |v| v),
+                )
+            },
             -1
         );
         assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);

@@ -1198,18 +1198,63 @@ static void test_delete_rows(const std::string& dst_uri) {
     PASS();
 }
 
+static void check_distance_range_results(struct ArrowArrayStream *stream,
+                                         const float *lower, const float *upper,
+                                         uint32_t expected_ids, int64_t expected_count) {
+    struct ArrowSchema schema = {};
+    assert(stream->get_schema(stream, &schema) == 0);
+    int id_column = -1, distance_column = -1;
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        if (strcmp(schema.children[i]->name, "id") == 0) id_column = (int)i;
+        if (strcmp(schema.children[i]->name, "_distance") == 0) distance_column = (int)i;
+    }
+    assert(id_column >= 0 && distance_column >= 0);
+    assert(strcmp(schema.children[id_column]->format, "i") == 0 &&
+           strcmp(schema.children[distance_column]->format, "f") == 0);
+    schema.release(&schema);
+    int64_t rows = 0;
+    uint32_t seen = 0;
+    while (1) {
+        struct ArrowArray array = {};
+        assert(stream->get_next(stream, &array) == 0);
+        if (!array.release) break;
+        const struct ArrowArray *ids = array.children[id_column];
+        const struct ArrowArray *distances = array.children[distance_column];
+        const int32_t *id_values = (const int32_t *)ids->buffers[1];
+        const float *distance_values = (const float *)distances->buffers[1];
+        for (int64_t i = 0; i < array.length; ++i) {
+            int32_t id = id_values[ids->offset + i];
+            float distance = distance_values[distances->offset + i];
+            assert(id >= 1 && id <= 20);
+            uint32_t bit = 1u << (id - 1);
+            assert((seen & bit) == 0);
+            seen |= bit;
+            assert(distance >= 0.0f && (!lower || distance >= *lower) && (!upper || distance < *upper));
+        }
+        rows += array.length;
+        array.release(&array);
+    }
+    assert(rows == expected_count && seen == expected_ids);
+    stream->release(stream);
+}
+
 static void test_distance_range(const std::string& uri) {
     TEST(test_distance_range);
     auto ds = lance::Dataset::open(uri);
     float query[8];
     for (int i = 0; i < 8; ++i) query[i] = 0.1f + static_cast<float>(i);
-    const int64_t expected[] = {2, 1, 20};
-    for (int mode = 0; mode < 3; ++mode) {
+    const int64_t expected[] = {2, 1, 20, 20, 0};
+    const uint32_t expected_ids[] = {3u, 2u, (1u << 20) - 1, (1u << 20) - 1, 0u};
+    for (int mode = 0; mode < 5; ++mode) {
         auto scanner = ds.scan();
         scanner.nearest("embedding", query, 8, 20).use_index(false);
-        if (mode == 1) scanner.distance_range(0.02f, 0.125f);
-        else scanner.distance_range(std::nullopt, 0.125f);
-        if (mode == 2) scanner.distance_range();
+        std::optional<float> lower = mode == 1 ? std::optional<float>(0.02f) : std::nullopt;
+        std::optional<float> upper = 0.125f;
+        // Row 1 has exactly zero distance: modes 3/4 distinguish >= from > and < from <=.
+        if (mode == 3) { lower = 0.0f; upper = std::nullopt; }
+        if (mode == 4) upper = 0.0f;
+        scanner.distance_range(lower, upper);
+        if (mode == 2) { scanner.distance_range(); lower.reset(); upper.reset(); }
         bool rejected = false;
         try {
             scanner.distance_range(1.0f, 0.0f);
@@ -1220,16 +1265,8 @@ static void test_distance_range(const std::string& uri) {
         assert(rejected);
         ArrowArrayStream stream{};
         scanner.to_arrow_stream(&stream);
-        int64_t rows = 0;
-        while (true) {
-            ArrowArray array{};
-            assert(stream.get_next(&stream, &array) == 0);
-            if (!array.release) break;
-            rows += array.length;
-            array.release(&array);
-        }
-        assert(rows == expected[mode]);
-        stream.release(&stream);
+        check_distance_range_results(&stream, lower ? &*lower : nullptr,
+                                     upper ? &*upper : nullptr, expected_ids[mode], expected[mode]);
     }
     PASS();
 }
