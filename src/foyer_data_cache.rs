@@ -14,16 +14,16 @@ use std::sync::{Arc, Mutex, Weak};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCachePolicy, PsyncIoEngineConfig,
+    BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
+    HybridCacheBuilder, HybridCachePolicy, PsyncIoEngineConfig,
 };
 use futures::stream::BoxStream;
 use lance_io::object_store::WrappingObjectStore;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, Result,
+    Attribute, Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, RenameOptions, Result,
 };
 
 use crate::data_cache::{DataCacheFactory, DatasetDataCache, LanceDataCacheStatistics};
@@ -166,6 +166,7 @@ fn u64_to_usize(value: u64, field: &'static str) -> lance_core::Result<usize> {
 #[derive(Clone)]
 pub(crate) struct FoyerDataCache {
     cache: HybridCache<String, Bytes>,
+    metadata: Cache<String, (ObjectMeta, Attributes)>,
     read_block_size: usize,
     wrapped_stores: Arc<Mutex<HashMap<usize, WrappedStore>>>,
 }
@@ -199,6 +200,33 @@ impl FoyerDataCache {
             .with_capacity(disk_capacity)
             .build()?;
         let engine = BlockEngineConfig::new(device).with_block_size(engine_block_size);
+        // Single-range reads use get_opts(), which must return object metadata.
+        // Share a bounded metadata cache across dataset scopes so a data-cache hit
+        // does not require another HEAD request for an immutable data file.
+        let metadata_capacity = memory_capacity / 8;
+        let metadata = CacheBuilder::new(metadata_capacity)
+            .with_shards(1)
+            .with_weighter(
+                |key: &String, (meta, attributes): &(ObjectMeta, Attributes)| {
+                    key.len()
+                        + std::mem::size_of::<(ObjectMeta, Attributes)>()
+                        + meta.location.as_ref().len()
+                        + meta.e_tag.as_ref().map_or(0, String::len)
+                        + meta.version.as_ref().map_or(0, String::len)
+                        + attributes
+                            .iter()
+                            .map(|(attribute, value)| {
+                                std::mem::size_of::<(Attribute, object_store::AttributeValue)>()
+                                    + value.as_ref().len()
+                                    + match attribute {
+                                        Attribute::Metadata(name) => name.len(),
+                                        _ => 0,
+                                    }
+                            })
+                            .sum::<usize>()
+                },
+            )
+            .build();
         let cache = HybridCacheBuilder::new()
             .with_name("lance_data")
             .with_policy(HybridCachePolicy::WriteOnInsertion)
@@ -215,6 +243,7 @@ impl FoyerDataCache {
             .await?;
         Ok(Self {
             cache,
+            metadata,
             read_block_size,
             wrapped_stores: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -407,24 +436,32 @@ impl DataCacheObjectStore {
     }
 
     async fn cached_get(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        // Fetch metadata separately so the returned GetResult retains the origin's identity while
-        // its payload uses the same block cache as get_ranges(). This also provides the object size
-        // needed to resolve bounded, offset, and suffix ranges.
-        let GetResult {
-            meta: metadata,
-            attributes,
-            ..
-        } = self
+        let metadata_key = self
             .reader
-            .original
-            .get_opts(
-                location,
-                GetOptions {
-                    head: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            .cache
+            .size_key(&self.reader.store_prefix, location);
+        let cached_metadata = self.reader.cache.metadata.get(&metadata_key);
+        let (metadata, attributes) = if let Some(entry) = cached_metadata {
+            entry.value().clone()
+        } else {
+            let result = self
+                .reader
+                .original
+                .get_opts(
+                    location,
+                    GetOptions {
+                        head: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            // Cache only immutable metadata and attributes, never request-specific state.
+            self.reader.cache.metadata.insert(
+                metadata_key,
+                (result.meta.clone(), result.attributes.clone()),
+            );
+            (result.meta, result.attributes)
+        };
         let object_size = metadata.size;
         self.reader.cache.cache.insert(
             self.reader
@@ -811,6 +848,140 @@ mod tests {
     ) -> (Arc<dyn ObjectStore>, Arc<DatasetFoyerDataCache>) {
         let scope = cache.create_scope();
         (scope.wrap("memory://test", original), scope)
+    }
+
+    #[tokio::test]
+    async fn cached_http_ranges_do_not_repeat_head_requests() {
+        use object_store::aws::AmazonS3Builder;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let heads = Arc::new(AtomicU64::new(0));
+        let gets = Arc::new(AtomicU64::new(0));
+        let server_heads = heads.clone();
+        let server_gets = gets.clone();
+        let data = Bytes::from((0..8192).map(|value| value as u8).collect::<Vec<_>>());
+        let server_data = data.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                    assert!(request.len() < 16 * 1024);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let is_head = request.starts_with("HEAD ");
+                let range = request.lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("range: bytes=")
+                        .map(|range| {
+                            let (start, end) = range.split_once('-').unwrap();
+                            start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap() + 1
+                        })
+                });
+                let (status, content_range, range) = match range {
+                    Some(range) => (
+                        "206 Partial Content",
+                        format!(
+                            "Content-Range: bytes {}-{}/{}\r\n",
+                            range.start,
+                            range.end - 1,
+                            server_data.len()
+                        ),
+                        range,
+                    ),
+                    None => ("200 OK", String::new(), 0..server_data.len()),
+                };
+                if is_head {
+                    server_heads.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    server_gets.fetch_add(1, Ordering::SeqCst);
+                }
+                let headers = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{content_range}Last-Modified: Tue, 01 Sep 2026 00:00:00 GMT\r\nETag: \"sample\"\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    range.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                if !is_head {
+                    socket.write_all(&server_data[range]).await.unwrap();
+                }
+            }
+        });
+
+        // Use a real HTTP client: in-memory stores do not exercise transport extensions.
+        let original = Arc::new(
+            AmazonS3Builder::new()
+                .with_bucket_name("example-bucket")
+                .with_region("us-east-1")
+                .with_endpoint(format!("http://{address}"))
+                .with_allow_http(true)
+                // An explicit excluded proxy also disables environment proxy discovery.
+                .with_proxy_url("http://127.0.0.1:1")
+                .with_proxy_excludes("127.0.0.1")
+                .with_skip_signature(true)
+                .build()
+                .unwrap(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let cache = FoyerDataCache::try_new(directory.path(), 128 * 1024, 1024 * 1024, 4096)
+            .await
+            .unwrap();
+        let path = Path::from("table.lance/data/sample.lance");
+        let (wrapped, _) = wrap_for_test(&cache, original.clone());
+        let first = wrapped
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(100..200)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let meta = first.meta.clone();
+        let attributes = first.attributes.clone();
+        assert_eq!(first.range, 100..200);
+        assert_eq!(first.bytes().await.unwrap(), data.slice(100..200));
+        assert_eq!(heads.load(Ordering::SeqCst), 1);
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+
+        // Metadata must be shared with fresh dataset scopes, just like cached blocks.
+        let (fresh, _) = wrap_for_test(&cache, original);
+        for store in [&wrapped, &fresh] {
+            let result = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(120..180)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.meta, meta);
+            assert_eq!(result.attributes, attributes);
+            assert_eq!(result.range, 120..180);
+            assert_eq!(result.bytes().await.unwrap(), data.slice(120..180));
+        }
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            1,
+            "cache hits must not issue HEAD"
+        );
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "cache hits must not issue GET"
+        );
+        wrapped.head(&path).await.unwrap();
+        assert_eq!(
+            heads.load(Ordering::SeqCst),
+            2,
+            "explicit HEAD must bypass cache"
+        );
+        server.abort();
     }
 
     #[tokio::test]
