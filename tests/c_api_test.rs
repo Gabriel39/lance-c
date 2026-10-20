@@ -18129,8 +18129,52 @@ fn test_prewarm_index_invalid_arguments_and_missing_index() {
                 .contains("missing_idx")
         );
         lance_free_string(message);
+        assert_eq!(lance_dataset_prewarm_index(ds, c"id".as_ptr()), -1);
+        assert_eq!(lance_last_error_code(), LanceErrorCode::NotFound);
         assert_eq!(lance_dataset_count_rows(ds), 5);
         lance_dataset_close(ds);
+    }
+}
+
+#[test]
+fn test_prewarm_index_scalar_name_collides_with_other_column() {
+    for index_type in [LanceScalarIndexType::BTree, LanceScalarIndexType::Inverted] {
+        let (_tmp, uri) = create_test_dataset();
+        unsafe {
+            let ds = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), 0);
+            assert!(!ds.is_null());
+            let params = c_str(r#"{"base_tokenizer":"simple","language":"English"}"#);
+            assert_eq!(
+                lance_dataset_create_scalar_index(
+                    ds,
+                    c"name".as_ptr(),
+                    c"id".as_ptr(),
+                    index_type as i32,
+                    if index_type == LanceScalarIndexType::Inverted {
+                        params.as_ptr()
+                    } else {
+                        ptr::null()
+                    },
+                    false,
+                ),
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            let version = lance_dataset_version(ds);
+            lance_dataset_close(ds);
+            // Scalar and FTS prewarm must retain their SDK validation on a fresh session too.
+            let cold = lance_dataset_open(c_str(&uri).as_ptr(), ptr::null(), version);
+            assert!(!cold.is_null());
+            assert_eq!(
+                lance_dataset_prewarm_index(cold, c"id".as_ptr()),
+                0,
+                "{}",
+                take_last_error_message()
+            );
+            assert_eq!(lance_dataset_version(cold), version);
+            lance_dataset_close(cold);
+        }
     }
 }
 
@@ -18162,6 +18206,21 @@ fn test_prewarm_index_scalar_segments_and_snapshot() {
 
 #[test]
 fn test_prewarm_index_vector_segments_reuse_shared_session() {
+    check_prewarm_index_vector_segments_reuse_shared_session(c"vector_idx");
+}
+
+#[test]
+fn test_prewarm_index_vector_name_matches_indexed_column() {
+    check_prewarm_index_vector_segments_reuse_shared_session(c"embedding");
+}
+
+#[test]
+fn test_prewarm_index_vector_name_collides_with_scalar_column() {
+    // A fresh session must resolve the vector field from metadata, not the scalar column named id.
+    check_prewarm_index_vector_segments_reuse_shared_session(c"id");
+}
+
+fn check_prewarm_index_vector_segments_reuse_shared_session(index_name: &std::ffi::CStr) {
     use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
     let (_tmp, uri) = create_multi_fragment_vector_dataset(2, 64, 8, false);
     lance_c::runtime::block_on(async {
@@ -18171,14 +18230,14 @@ fn test_prewarm_index_vector_segments_reuse_shared_session() {
         for fragment in ds.get_fragments() {
             segments.push(
                 ds.create_index_builder(&["embedding"], lance_index::IndexType::Vector, &params)
-                    .name("vector_idx".into())
+                    .name(index_name.to_str().unwrap().into())
                     .fragments(vec![fragment.id() as u32])
                     .execute_uncommitted()
                     .await
                     .unwrap(),
             );
         }
-        ds.commit_existing_index_segments("vector_idx", "embedding", segments)
+        ds.commit_existing_index_segments(index_name.to_str().unwrap(), "embedding", segments)
             .await
             .unwrap();
     });
@@ -18240,11 +18299,16 @@ fn test_prewarm_index_vector_segments_reuse_shared_session() {
         let ds = lance_dataset_open_with_session(c_str(&uri).as_ptr(), ptr::null(), 0, session);
         assert!(!ds.is_null());
         assert_eq!(
-            lance_dataset_index_segment_count(ds, c"vector_idx".as_ptr()),
+            lance_dataset_index_segment_count(ds, index_name.as_ptr()),
             2
         );
         let version = lance_dataset_version(ds);
-        assert_eq!(lance_dataset_prewarm_index(ds, c"vector_idx".as_ptr()), 0);
+        assert_eq!(
+            lance_dataset_prewarm_index(ds, index_name.as_ptr()),
+            0,
+            "{}",
+            take_last_error_message()
+        );
         assert_eq!(lance_dataset_version(ds), version);
         let mut warmed = LanceSessionCacheStats::default();
         assert_eq!(lance_session_get_cache_stats(session, &mut warmed), 0);
@@ -18274,7 +18338,7 @@ fn test_prewarm_index_vector_segments_reuse_shared_session() {
         // even after its C session handle is released.
         lance_session_close(session);
         assert_eq!(
-            lance_dataset_prewarm_index(reopened, c"vector_idx".as_ptr()),
+            lance_dataset_prewarm_index(reopened, index_name.as_ptr()),
             0
         );
         assert_eq!(lance_dataset_version(reopened), version);

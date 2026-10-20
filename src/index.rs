@@ -10,9 +10,10 @@ use std::ffi::{CString, c_char};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray};
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Result;
 use lance_index::IndexType;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
 use crate::dataset::LanceDataset;
@@ -297,8 +298,48 @@ unsafe fn prewarm_index_inner(
     // Keep one snapshot and its shared session alive without holding the
     // dataset lock across potentially long-running index IO.
     let snapshot = unsafe { &*dataset }.snapshot();
-    block_on(snapshot.prewarm_index(index_name))?;
+    block_on(prewarm_index_by_name(&snapshot, index_name))?;
     Ok(0)
+}
+
+async fn prewarm_index_by_name(dataset: &lance::Dataset, index_name: &str) -> Result<()> {
+    let Some(named_field) = dataset.schema().field(index_name) else {
+        return dataset.prewarm_index(index_name).await;
+    };
+    let indices = dataset.load_indices_by_name(index_name).await?;
+    if indices.is_empty() {
+        return dataset.prewarm_index(index_name).await;
+    }
+
+    let mut sdk_segments = Vec::new();
+    for metadata in indices {
+        let Some(&field_id) = metadata.fields.first() else {
+            sdk_segments.push(metadata.uuid);
+            continue;
+        };
+        if field_id == named_field.id {
+            sdk_segments.push(metadata.uuid);
+            continue;
+        }
+        // The pinned SDK interprets an index name as a schema column first.
+        // Open colliding vector segments by their indexed field, even on a cold cache.
+        let field_path = dataset.schema().field_path(field_id)?;
+        let index = dataset
+            .open_generic_index(&field_path, &metadata.uuid, &NoOpMetricsCollector)
+            .await?;
+        if index.index_type().is_vector() {
+            index.prewarm().await?;
+        } else {
+            sdk_segments.push(metadata.uuid);
+        }
+    }
+    // Keep scalar/FTS validation, including aggregate FTS residency checks, in the SDK.
+    if !sdk_segments.is_empty() {
+        dataset
+            .prewarm_index_segments(index_name, &sdk_segments)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Drop an index by name.
