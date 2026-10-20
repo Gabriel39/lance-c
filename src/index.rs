@@ -7,6 +7,7 @@
 //! scanners that already cloned the inner Arc keep their snapshot view.
 
 use std::ffi::{CString, c_char};
+use std::future::Future;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray};
@@ -15,6 +16,8 @@ use lance_core::Result;
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_table::format::IndexMetadata;
+use uuid::Uuid;
 
 use crate::dataset::LanceDataset;
 use crate::error::ffi_try;
@@ -311,28 +314,22 @@ async fn prewarm_index_by_name(dataset: &lance::Dataset, index_name: &str) -> Re
         return dataset.prewarm_index(index_name).await;
     }
 
-    let mut sdk_segments = Vec::new();
-    for metadata in indices {
-        let Some(&field_id) = metadata.fields.first() else {
-            sdk_segments.push(metadata.uuid);
-            continue;
-        };
-        if field_id == named_field.id {
-            sdk_segments.push(metadata.uuid);
-            continue;
-        }
-        // The pinned SDK interprets an index name as a schema column first.
-        // Open colliding vector segments by their indexed field, even on a cold cache.
-        let field_path = dataset.schema().field_path(field_id)?;
-        let index = dataset
-            .open_generic_index(&field_path, &metadata.uuid, &NoOpMetricsCollector)
-            .await?;
-        if index.index_type().is_vector() {
-            index.prewarm().await?;
-        } else {
-            sdk_segments.push(metadata.uuid);
-        }
-    }
+    let sdk_segments =
+        prewarm_colliding_segments(indices, named_field.id, |field_id, uuid| async move {
+            // The pinned SDK interprets an index name as a schema column first.
+            // Open colliding vector segments by their indexed field, even on a cold cache.
+            let field_path = dataset.schema().field_path(field_id)?;
+            let index = dataset
+                .open_generic_index(&field_path, &uuid, &NoOpMetricsCollector)
+                .await?;
+            if index.index_type().is_vector() {
+                index.prewarm().await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .await?;
     // Keep scalar/FTS validation, including aggregate FTS residency checks, in the SDK.
     if !sdk_segments.is_empty() {
         dataset
@@ -341,6 +338,38 @@ async fn prewarm_index_by_name(dataset: &lance::Dataset, index_name: &str) -> Re
     }
     Ok(())
 }
+
+async fn prewarm_colliding_segments<F, Fut>(
+    indices: Vec<IndexMetadata>,
+    named_field_id: i32,
+    open_and_prewarm: F,
+) -> Result<Vec<Uuid>>
+where
+    F: Fn(i32, Uuid) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    // Both opening and prewarming can perform remote I/O. Keep the entire
+    // segment operation concurrent, with the SDK's fail-fast cancellation.
+    let segments = futures::future::try_join_all(indices.into_iter().map(|metadata| {
+        let open_and_prewarm = &open_and_prewarm;
+        async move {
+            let Some(&field_id) = metadata.fields.first() else {
+                return Ok::<_, lance_core::Error>(Some(metadata.uuid));
+            };
+            if field_id == named_field_id || !open_and_prewarm(field_id, metadata.uuid).await? {
+                Ok(Some(metadata.uuid))
+            } else {
+                Ok(None)
+            }
+        }
+    }))
+    .await?;
+    Ok(segments.into_iter().flatten().collect())
+}
+
+#[cfg(test)]
+#[path = "index_tests.rs"]
+mod tests;
 
 /// Drop an index by name.
 #[unsafe(no_mangle)]
