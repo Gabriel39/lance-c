@@ -128,12 +128,20 @@ estimate at least as large as the domain's physical row count selects a scoped
 non-indexed scan. The full filter, deletion handling, explicit fragment scope and
 LIMIT/OFFSET remain in effect on every path; estimates never remove result rows.
 
-Each preparation considers at most eight physical segments and an aggregate 8 MiB
-of lookup files. One lookup is limited to 65,536 pages, IN predicates to 256 values,
-and one estimate to 1,000,000 page/predicate checks. Lookup batches share the
-Session's bounded metadata cache. Unknown manifest file sizes, unsupported formats,
-probe errors, or an unestimable default retain the original segment path. Bitmap
-and LabelList segments retain their existing behavior and are not cost-ranked.
+Each preparation considers at most eight physical segments, an aggregate 8 MiB
+of lookup files, and a separate 8 MiB allowance for decoded lookup buffers. The
+decoded allowance is checked from schema and row count before materialization and
+charged for both cached and newly loaded lookups. Only fixed-width scalar lookup
+columns have a known bound with the current reader API. Variable-width keys such
+as strings/binary therefore have unknown costs: a default on such a key is kept,
+and an alternative is skipped without opening its lookup for estimation. Such
+indices remain usable through the caller's existing segment-selection path.
+
+One lookup is limited to 65,536 pages, IN predicates to 256 values, and one estimate
+to 1,000,000 page/predicate checks. Lookup batches share the Session's bounded
+metadata cache. Unknown manifest file sizes, unsupported formats, probe errors,
+or an unestimable default retain the original segment path. Bitmap and LabelList
+segments retain their existing behavior and are not cost-ranked.
 
 Statistics callbacks report `scalar_index_auto_candidates`,
 `scalar_index_auto_changed`, `scalar_index_auto_estimated_pages`,

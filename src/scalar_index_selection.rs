@@ -7,6 +7,7 @@
 use std::{borrow::Cow, cmp::Ordering, ops::Bound};
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
 use lance::{
     Dataset,
@@ -30,6 +31,7 @@ use crate::scalar_segment::scoped_expression;
 
 const MAX_CANDIDATES: usize = 8;
 const MAX_LOOKUP_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DECODED_LOOKUP_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOOKUP_PAGES: usize = 65_536;
 const MAX_IN_VALUES: usize = 256;
 const MAX_ESTIMATE_COMPARISONS: usize = 1_000_000;
@@ -37,6 +39,41 @@ const MAX_ESTIMATE_COMPARISONS: usize = 1_000_000;
 struct Lookup {
     batch: RecordBatch,
     rows_per_page: u64,
+    decoded_bytes: usize,
+}
+
+struct ProbeBudget {
+    serialized_bytes: u64,
+    decoded_bytes: usize,
+}
+
+impl Default for ProbeBudget {
+    fn default() -> Self {
+        Self {
+            serialized_bytes: MAX_LOOKUP_BYTES,
+            decoded_bytes: MAX_DECODED_LOOKUP_BYTES,
+        }
+    }
+}
+
+fn fixed_width(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Null => Some(0),
+        DataType::Boolean => Some(1),
+        DataType::FixedSizeBinary(width) => usize::try_from(*width).ok(),
+        _ => data_type.primitive_width(),
+    }
+}
+
+fn decoded_lookup_bytes(schema: &lance_core::datatypes::Schema, rows: usize) -> Option<usize> {
+    schema.fields.iter().try_fold(0_usize, |bytes, field| {
+        let values = rows.checked_mul(fixed_width(&field.data_type())?)?;
+        // Include validity buffers, buffer alignment, and per-column Arrow overhead.
+        bytes
+            .checked_add(values)?
+            .checked_add(rows.div_ceil(8))?
+            .checked_add(1024)
+    })
 }
 
 impl DeepSizeOf for Lookup {
@@ -183,11 +220,15 @@ async fn estimate_cost(
     dataset: &Dataset,
     index: &IndexMetadata,
     expr: &ScalarIndexExpr,
-    remaining_bytes: &mut u64,
+    budget: &mut ProbeBudget,
 ) -> Option<(u64, usize)> {
     if !is_btree_expression(expr) {
         return None;
     }
+    // Compressed/dictionary strings have no decoded-size bound in IndexReader.
+    // Skip them before even opening an advisory probe, independently of cache size.
+    let field = dataset.schema().field_by_id(index.keyed_field()?)?;
+    fixed_width(&field.data_type())?;
     // Inspect immutable manifest sizes before opening a file. Older/partition-only
     // layouts without this root are deliberately left to the existing search path.
     let size = index
@@ -196,10 +237,11 @@ async fn estimate_cost(
         .iter()
         .find(|f| f.path == BTREE_LOOKUP_NAME)?
         .size_bytes;
-    if size > *remaining_bytes {
+    if size > budget.serialized_bytes {
         return None;
     }
-    *remaining_bytes -= size;
+    budget.serialized_bytes -= size;
+    let available_decoded_bytes = budget.decoded_bytes;
     let key = LookupKey(format!("{}/{}", dataset.uri(), index.uuid));
     let session = dataset.session();
     let lookup = session
@@ -210,6 +252,15 @@ async fn estimate_cost(
             if reader.num_rows() > MAX_LOOKUP_PAGES {
                 return Err(Error::not_supported(
                     "BTree cost lookup exceeds the page budget",
+                ));
+            }
+            let decoded_bytes = decoded_lookup_bytes(reader.schema(), reader.num_rows())
+                .ok_or_else(|| Error::not_supported("BTree cost lookup decoded size is unknown"))?;
+            // Cache admission runs after the loader. Bound decoded buffers before
+            // read_range, not after an allocation that may already exhaust memory.
+            if decoded_bytes > available_decoded_bytes {
+                return Err(Error::not_supported(
+                    "BTree cost lookup exceeds the decoded byte budget",
                 ));
             }
             let rows_per_page = reader
@@ -227,10 +278,13 @@ async fn estimate_cost(
             Ok(Lookup {
                 batch,
                 rows_per_page,
+                decoded_bytes,
             })
         })
         .await
         .ok()?;
+    // Cache hits consume the same preparation budget as newly loaded lookups.
+    budget.decoded_bytes = budget.decoded_bytes.checked_sub(lookup.decoded_bytes)?;
     let pages = estimate_pages(&lookup.batch, expr)?;
     Some((lookup.rows_per_page.saturating_mul(pages as u64), pages))
 }
@@ -253,12 +307,12 @@ pub(crate) async fn choose(
     if !is_btree_expression(&grouping_expr) {
         return Some((grouping.uuid, grouping_expr));
     }
-    let mut remaining_bytes = MAX_LOOKUP_BYTES;
+    let mut budget = ProbeBudget::default();
     stats
         .all_counts
         .insert("scalar_index_auto_candidates".into(), 1);
     let Some((mut cost, mut pages)) =
-        estimate_cost(dataset, grouping, &grouping_expr, &mut remaining_bytes).await
+        estimate_cost(dataset, grouping, &grouping_expr, &mut budget).await
     else {
         return Some((grouping.uuid, grouping_expr));
     };
@@ -301,7 +355,7 @@ pub(crate) async fn choose(
         }
         candidates += 1;
         if let Some((candidate_cost, candidate_pages)) =
-            estimate_cost(dataset, candidate, &expr, &mut remaining_bytes).await
+            estimate_cost(dataset, candidate, &expr, &mut budget).await
             && candidate_cost < cost
         {
             cost = candidate_cost;
@@ -408,5 +462,237 @@ mod tests {
             ));
         }
         assert_eq!(estimate_pages(&lookup(), &expression), None);
+    }
+
+    #[tokio::test]
+    async fn compressed_long_string_probes_are_not_materialized() {
+        use arrow_array::StringArray;
+        use lance::{dataset::WriteParams, index::DatasetIndexExt};
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp.path().join("compressed_lookup");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("key", DataType::Utf8, false),
+        ]));
+        let value = "a".repeat(64 * 1024);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..1024)),
+                Arc::new(StringArray::from(vec![value.as_str(); 1024])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                Some("key_idx".into()),
+                &ScalarIndexParams {
+                    params: Some(r#"{"zone_size":1}"#.into()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams {
+                    params: Some(r#"{"zone_size":64}"#.into()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "key_idx")
+            .unwrap();
+        let size = index
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|file| file.path == BTREE_LOOKUP_NAME)
+            .unwrap()
+            .size_bytes;
+        // The writer compresses these extrema below the I/O budget, but their
+        // decoded StringArray values alone would occupy 128 MiB.
+        assert!(size < MAX_LOOKUP_BYTES);
+        let mut expression = eq(0);
+        if let ScalarIndexExpr::Query(search) = &mut expression {
+            search.query = Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Utf8(Some("a".into()))),
+                Bound::Unbounded,
+            ));
+        }
+        assert_eq!(
+            estimate_cost(&dataset, index, &expression, &mut ProbeBudget::default()).await,
+            None,
+        );
+        let numeric = indices.iter().find(|index| index.name == "id_idx").unwrap();
+        let mut numeric_expr = eq(123);
+        if let ScalarIndexExpr::Query(search) = &mut numeric_expr {
+            search.column = "id".into();
+            search.index_name = "id_idx".into();
+        }
+        let query = ScalarIndexExpr::And(Box::new(numeric_expr.clone()), Box::new(expression));
+        let fragments: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u64)
+            .collect();
+        let selected = choose(
+            &dataset,
+            &indices,
+            numeric,
+            numeric_expr,
+            &query,
+            ReadDomain {
+                fragment_ids: &fragments,
+                physical_rows: 1024,
+            },
+            &mut ExecutionSummaryCounts::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.0, numeric.uuid);
+        assert!(
+            dataset
+                .session()
+                .file_metadata_cache()
+                .get_with_key(&LookupKey(format!("{}/{}", dataset.uri(), index.uuid)))
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decoded_lookup_size_bounds_fixed_width_buffers_and_checks_overflow() {
+        let batch = lookup();
+        let schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap();
+        assert!(
+            decoded_lookup_bytes(&schema, batch.num_rows()).unwrap()
+                >= batch.get_array_memory_size()
+        );
+        assert_eq!(decoded_lookup_bytes(&schema, usize::MAX), None);
+        let wide = Schema::new(vec![Field::new(
+            "min",
+            DataType::FixedSizeBinary(1024),
+            true,
+        )]);
+        let wide = lance_core::datatypes::Schema::try_from(&wide).unwrap();
+        assert!(decoded_lookup_bytes(&wide, MAX_LOOKUP_PAGES).unwrap() > MAX_DECODED_LOOKUP_BYTES);
+    }
+
+    #[test]
+    fn variable_width_lookup_sizes_are_unknown_before_decoding() {
+        for data_type in [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+        ] {
+            let schema = Schema::new(vec![Field::new("min", data_type, true)]);
+            let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
+            assert_eq!(decoded_lookup_bytes(&schema, 1), None);
+        }
+        assert_eq!(fixed_width(&DataType::Boolean), Some(1));
+        assert_eq!(fixed_width(&DataType::Null), Some(0));
+        assert_eq!(fixed_width(&DataType::FixedSizeBinary(-1)), None);
+    }
+
+    #[tokio::test]
+    async fn decoded_budget_applies_before_loading_and_to_cached_probes() {
+        use lance::index::DatasetIndexExt;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp.path().join("fixed_width_lookup");
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..32))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                Some("key_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index = &indices[0];
+        let key = LookupKey(format!("{}/{}", dataset.uri(), index.uuid));
+        let mut small = ProbeBudget {
+            decoded_bytes: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            estimate_cost(&dataset, index, &eq(15), &mut small).await,
+            None
+        );
+        assert!(
+            dataset
+                .session()
+                .file_metadata_cache()
+                .get_with_key(&key)
+                .await
+                .is_none()
+        );
+        assert!(
+            estimate_cost(&dataset, index, &eq(15), &mut ProbeBudget::default())
+                .await
+                .is_some()
+        );
+        let cached = dataset
+            .session()
+            .file_metadata_cache()
+            .get_with_key(&key)
+            .await
+            .unwrap();
+        let mut aggregate = ProbeBudget {
+            decoded_bytes: cached.decoded_bytes,
+            ..Default::default()
+        };
+        assert!(
+            estimate_cost(&dataset, index, &eq(15), &mut aggregate)
+                .await
+                .is_some()
+        );
+        assert_eq!(aggregate.decoded_bytes, 0);
+        assert_eq!(
+            estimate_cost(&dataset, index, &eq(15), &mut aggregate).await,
+            None
+        );
     }
 }
